@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(npx create-next-app@latest . --typescript --tailwind --eslint --app --no-src-dir --import-alias \"@/*\" --yes)",
-      "Bash(npx shadcn@latest init --yes --defaults)"
+      "Bash(npx shadcn@latest init --yes --defaults)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(node -e \"const t = require\\('three'\\); console.log\\(t.REVISION\\)\")",
+      "Bash(npx shadcn@latest add tabs --yes)"
     ]
   }
 }
