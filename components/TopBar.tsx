@@ -16,7 +16,7 @@ export default function TopBar({ show2D, onToggle2D }: Props) {
   return (
     <header className="flex items-center justify-between px-4 h-12 border-b border-gray-200 bg-white shrink-0">
       <span className="text-sm font-semibold text-gray-700 tracking-wide select-none">
-        Space Planner
+        gravio
       </span>
 
       <div className="flex items-center gap-2">
