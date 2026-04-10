@@ -20,6 +20,7 @@ import {
   buildNanoBananaPromptJson,
   collectPlacedModelSnapshots,
 } from "@/lib/buildNanoBananaPrompt";
+import { buildArchitecturalModelDetail } from "@/lib/nanoBananaArchitecturalDetail";
 import { VIEWPORT_OUTDOOR_SPEC } from "@/lib/viewportOutdoorSpec";
 
 interface Props {
@@ -3253,6 +3254,20 @@ export default function IfcViewport({
   const [nanoBananaFeedback, setNanoBananaFeedback] = useState<string | null>(null);
   const [viewportSnapshotFeedback, setViewportSnapshotFeedback] = useState<string | null>(null);
 
+  const nanoBananaArchitecturalModels = useMemo(() => {
+    const out: ReturnType<typeof buildArchitecturalModelDetail>[] = [];
+    for (const m of models) {
+      if (!m.isPlaced) continue;
+      const placement = m.id === activeModelId && draftPlacement ? draftPlacement : m.placement;
+      const key = geometryCacheKey(m);
+      const entry = cache.get(key);
+      if (!entry) continue;
+      const fp = computeWorldFootprintFromObject(entry.object, entry.bounds, placement);
+      out.push(buildArchitecturalModelDetail(m, placement, fp, entry.bounds));
+    }
+    return out;
+  }, [models, activeModelId, draftPlacement, cache]);
+
   const handleCopyNanoBananaPrompt = useCallback(async () => {
     const canvas = canvasElementRef.current;
     const cam = cameraRef.current;
@@ -3271,6 +3286,7 @@ export default function IfcViewport({
         canvasCssWidth: w,
         canvasCssHeight: h,
         placedModels,
+        architecturalModels: nanoBananaArchitecturalModels,
         error: "Камера или canvas не готовы — подождите загрузку сцены.",
       });
       try {
@@ -3303,6 +3319,7 @@ export default function IfcViewport({
       canvasCssWidth: w,
       canvasCssHeight: h,
       placedModels,
+      architecturalModels: nanoBananaArchitecturalModels,
     });
     try {
       await navigator.clipboard.writeText(json);
@@ -3311,7 +3328,7 @@ export default function IfcViewport({
       setNanoBananaFeedback("Не удалось скопировать");
     }
     setTimeout(() => setNanoBananaFeedback(null), 3200);
-  }, [activeModelId, draftPlacement, models, viewMode]);
+  }, [activeModelId, draftPlacement, models, nanoBananaArchitecturalModels, viewMode]);
 
   const handleCopyViewportSnapshot = useCallback(async () => {
     const gl = glRef.current;

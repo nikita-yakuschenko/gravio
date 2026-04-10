@@ -1,5 +1,6 @@
 import type { IfcModelItem } from "@/types/ifc";
 import { VIEWPORT_OUTDOOR_SPEC } from "@/lib/viewportOutdoorSpec";
+import type { ArchitecturalModelDetail } from "@/lib/nanoBananaArchitecturalDetail";
 
 export type NanoBananaCameraSnapshot = {
   position: [number, number, number];
@@ -31,6 +32,7 @@ export type BuildNanoBananaPromptInput = {
   canvasCssWidth: number;
   canvasCssHeight: number;
   placedModels: PlacedModelSnapshot[];
+  architecturalModels: ArchitecturalModelDetail[];
   /** Если камера ещё не готова */
   error?: string;
 };
@@ -82,20 +84,38 @@ export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): st
           error: input.error ?? "Camera not ready — open the scene and wait for the view to load.",
         };
 
+  const reconstruction = {
+    summaryRu:
+      input.architecturalModels.length > 0
+        ? input.architecturalModels.map((m) => m.reconstructionPromptRu).join("\n\n")
+        : "Нет размещённых моделей с полными метаданными.",
+    summaryEn:
+      input.architecturalModels.length > 0
+        ? input.architecturalModels.map((m) => m.reconstructionPromptEn).join("\n\n")
+        : "No placed models with full metadata.",
+    perModelPrompts: input.architecturalModels.map((m) => ({
+      id: m.id,
+      ru: m.reconstructionPromptRu,
+      en: m.reconstructionPromptEn,
+    })),
+  };
+
   const generation = {
     intent: "nanoBanana_image_generation",
     instructionsRu: [
       "Сгенерируй одно изображение: фотореалистичный рендер архитектурной сцены.",
       "Камера, кадр и перспектива должны совпадать с блоком camera (позиция, target, FOV, aspect) — без сдвига и без другого угла.",
       "Окружение: живое наружное освещение днём, лёгкая дымка на горизонте, трава на земле, небо светло-голубое, как в environment.",
-      "Сохрани относительные положения и повороты зданий из scene.placedModels.",
+      "Архитектура: для каждого объекта в scene.architecturalModels используй численные габариты, след на земле, высоту, данные IFC (стены/окна/двери) и поля reconstructionPromptRu/en — здания должны быть визуально неотличимы по масштабу, пропорциям и характеру от эталона.",
+      "Не упрощай модели до коробок: сохраняй сложность, соответствующую числу треугольников в geometryMesh.",
       "Не добавляй логотипы и водяные знаки.",
     ],
     instructionsEn: [
       "Generate one photorealistic architectural render.",
       "Match the camera block exactly (position, look-at target, vertical FOV, aspect) — identical framing.",
       "Environment: outdoor daylight, soft atmospheric haze, grass ground, pale blue sky as in environment.",
-      "Keep building placements from scene.placedModels.",
+      "Architecture: for each entry in scene.architecturalModels follow numeric dimensions, ground footprint, height, IFC counts, and reconstructionPromptRu/en — buildings must match reference scale, proportions, and character.",
+      "Do not reduce buildings to primitive boxes; preserve detail consistent with triangle counts in geometryMesh.",
       "No logos or watermarks.",
     ],
   };
@@ -104,15 +124,17 @@ export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): st
     meta: {
       generator: "NanoBanana",
       sourceApp: "Gravio",
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportedAt: new Date().toISOString(),
       viewMode: input.viewMode,
     },
     environment: env,
     camera: cameraBlock,
     scene: {
-      placedModels: input.placedModels,
       units: "meters",
+      placedModels: input.placedModels,
+      architecturalModels: input.architecturalModels,
+      reconstruction,
     },
     generation,
   };
