@@ -136,6 +136,52 @@ type DragState =
     };
 
 const GROUND_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+/** Позиция камеры + target Orbit/MapControls для 2D/3D после перезагрузки. */
+const VIEWPORT_CAMERA_STORAGE_KEY = "gravio-viewport-camera-v1";
+
+type StoredViewportCamera = {
+  position: [number, number, number];
+  target: [number, number, number];
+};
+
+function parseStoredViewportCameras(): Partial<Record<"2d" | "3d", StoredViewportCamera>> {
+  try {
+    const raw = localStorage.getItem(VIEWPORT_CAMERA_STORAGE_KEY);
+    if (!raw) return {};
+    const data = JSON.parse(raw) as unknown;
+    if (!data || typeof data !== "object") return {};
+    return data as Partial<Record<"2d" | "3d", StoredViewportCamera>>;
+  } catch {
+    return {};
+  }
+}
+
+function isValidStoredViewportCamera(v: unknown): v is StoredViewportCamera {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  if (!Array.isArray(o.position) || o.position.length !== 3) return false;
+  if (!Array.isArray(o.target) || o.target.length !== 3) return false;
+  const nums = [...o.position, ...o.target];
+  return nums.every((n) => typeof n === "number" && Number.isFinite(n));
+}
+
+function persistViewportCamera(
+  viewMode: "2d" | "3d",
+  position: THREE.Vector3,
+  target: THREE.Vector3,
+) {
+  try {
+    const data = parseStoredViewportCameras();
+    data[viewMode] = {
+      position: [position.x, position.y, position.z],
+      target: [target.x, target.y, target.z],
+    };
+    localStorage.setItem(VIEWPORT_CAMERA_STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
 const MODEL_DND_MIME = "application/x-gravio-model-id";
 const ZERO_PLACEMENT: IfcModelItem["placement"] = { x: 0, y: 0, z: 0, rotationY: 0 };
 const MOVE_DRAG_SENSITIVITY = 0.24;
@@ -143,8 +189,15 @@ const MOVE_DRAG_MAX_STEP = 0.45;
 const MOVE_DRAG_DEAD_ZONE = 0.003;
 const ROTATE_DRAG_SENSITIVITY = 1;
 const ROTATE_DRAG_DEAD_ZONE = THREE.MathUtils.degToRad(0.08);
+/** Общий порог «параллельности» двух рёбер следа (рад) — магнит граней, зона близости, подсветка при rotate. */
 const PARALLEL_EDGE_TOLERANCE = THREE.MathUtils.degToRad(0.75);
-const PROXIMITY_HATCH_EDGE_TOLERANCE = THREE.MathUtils.degToRad(3);
+/** Зона близости только при том же угловом допуске, что и магнит параллельных граней (не путать с 3° — визуально «не параллельно»). */
+const PROXIMITY_HATCH_EDGE_TOLERANCE = PARALLEL_EDGE_TOLERANCE;
+/** При вращении: краткое «прилипание» к параллели рёбер следа (может быть чуть шире визуального порога). */
+const ROTATE_PARALLEL_EDGE_MAGNET_RAD = THREE.MathUtils.degToRad(3.2);
+/** Розовая подсветка рёбер в режиме rotate — совпадает по смыслу с зоной близости (иначе «параллельно» при ~6° вводило в заблуждение). */
+const ROTATE_PARALLEL_EDGE_HIGHLIGHT_RAD = PARALLEL_EDGE_TOLERANCE;
+const ROTATE_PARALLEL_EDGE_LINE_Y = 0.1;
 const ALIGNMENT_SNAP_DISTANCE = 0.35;
 const EDGE_ALIGNMENT_TOLERANCE = 0.03;
 /** Зона по нормали к параллельным рёбрам: подтягиваем активную модель к общей грани (магнит). */
@@ -954,6 +1007,51 @@ function getParallelDelta(a: GroundSegment, b: GroundSegment): number {
   return Math.min(diff, Math.abs(Math.PI - diff));
 }
 
+/** Минимальный поворот вокруг Y, чтобы направление ребра θa совпало с θb (с учётом обратного направления ребра). */
+function rotationShortestToParallelEdgeDirections(thetaA: number, thetaB: number): number {
+  const o1 = normalizeAngle(thetaB - thetaA);
+  const o2 = normalizeAngle(thetaB + Math.PI - thetaA);
+  return Math.abs(o1) <= Math.abs(o2) ? o1 : o2;
+}
+
+/** Подтягивает rotationY к параллели пары рёбер (магнит при вращении). */
+function applyParallelEdgeRotationSnap(
+  placement: IfcModelItem["placement"],
+  activeModelId: string,
+  sceneModelsList: Array<{ model: IfcModelItem; object: THREE.Group; bounds: ModelBounds }>,
+): IfcModelItem["placement"] {
+  if (sceneModelsList.length < 2) return placement;
+  const entry = sceneModelsList.find((s) => s.model.id === activeModelId);
+  if (!entry) return placement;
+  const { corners } = computeWorldFootprintFromObject(entry.object, entry.bounds, placement);
+  const activeSegs = getFootprintEdgeSegments(corners);
+  let closest: { sa: GroundSegment; tb: GroundSegment; distSq: number } | null = null;
+
+  for (const s of sceneModelsList) {
+    if (s.model.id === activeModelId) continue;
+    const o = computeWorldFootprintFromObject(s.object, s.bounds, s.model.placement);
+    const targetSegs = getFootprintEdgeSegments(o.corners);
+    for (const sa of activeSegs) {
+      for (const tb of targetSegs) {
+        const bridge = closestPointsOnSegments2D(sa.start, sa.end, tb.start, tb.end);
+        if (!closest || bridge.distanceSq < closest.distSq) {
+          closest = { sa, tb, distSq: bridge.distanceSq };
+        }
+      }
+    }
+  }
+  if (!closest) return placement;
+  const { sa, tb } = closest;
+  const err = getParallelDelta(sa, tb);
+  if (err > ROTATE_PARALLEL_EDGE_MAGNET_RAD) return placement;
+  const angA = getSegmentAngle(sa);
+  const angT = getSegmentAngle(tb);
+  const adj = rotationShortestToParallelEdgeDirections(angA, angT);
+  const t = Math.max(0, 1 - err / ROTATE_PARALLEL_EDGE_MAGNET_RAD);
+  const applied = adj * t;
+  return { ...placement, rotationY: normalizeAngle(placement.rotationY + applied) };
+}
+
 function getParallelLineDistance(a: GroundSegment, b: GroundSegment): number {
   const dx = a.end.x - a.start.x;
   const dz = a.end.z - a.start.z;
@@ -1206,6 +1304,18 @@ function buildProximityHatchArea(
       localToWorld(start.projection, start.offset),
       localToWorld(end.projection, end.offset),
     ]);
+  }
+
+  // Углы A,B строятся вдоль source; C,D — вдоль той же оси на смещении по нормали. При «почти
+  // параллельных» рёбрах (<3° в отборе) прямая C–D может не совпасть с отрезком target — тогда
+  // штриховка вводит в заблуждение (см. отладку d⊥ у C/D). Не показываем такую зону.
+  if (
+    !groundPointOnSegment(a, source).on ||
+    !groundPointOnSegment(b, source).on ||
+    !groundPointOnSegment(c, target).on ||
+    !groundPointOnSegment(d, target).on
+  ) {
+    return null;
   }
 
   return {
@@ -1961,6 +2071,44 @@ function ProximityHatchOverlay({
   );
 }
 
+/** Кадрирование по активному объекту, если нет сохранённого вида. */
+function applyViewportCameraFrameToFit(
+  perspective: THREE.PerspectiveCamera,
+  controls: { target: THREE.Vector3; update: () => void },
+  activeObject: THREE.Group | null,
+  viewMode: "2d" | "3d",
+) {
+  const target = new THREE.Vector3(0, 0, 0);
+  const bounds = activeObject ? new THREE.Box3().setFromObject(activeObject) : null;
+  const hasBounds = Boolean(bounds && !bounds.isEmpty());
+  const size = hasBounds ? bounds!.getSize(new THREE.Vector3()) : new THREE.Vector3(10, 10, 10);
+  if (hasBounds) bounds!.getCenter(target);
+
+  if (viewMode === "2d") {
+    const topSpan = Math.max(size.x, size.z, 1);
+    const fov = THREE.MathUtils.degToRad(Math.max(perspective.fov, 10));
+    const distance = (topSpan * 0.8) / Math.tan(fov / 2) + Math.max(size.y, 1) + 5;
+
+    perspective.up.set(0, 1, 0);
+    perspective.position.set(target.x, target.y + distance, target.z + 0.0001);
+    perspective.lookAt(target);
+    controls.target.copy(target);
+  } else {
+    const maxDim = Math.max(size.x, size.y, size.z, 1);
+    const distance = maxDim * 1.7;
+    const centerY = target.y;
+
+    perspective.up.set(0, 1, 0);
+    perspective.position.set(
+      target.x + distance,
+      centerY + distance * 0.75,
+      target.z + distance,
+    );
+    perspective.lookAt(target.x, centerY, target.z);
+    controls.target.set(target.x, centerY, target.z);
+  }
+}
+
 function CameraController({
   activeObject,
   viewMode,
@@ -1979,45 +2127,78 @@ function CameraController({
     activeObjectRef.current = activeObject;
   }, [activeObject]);
 
+  /** Восстановить сохранённый вид или кадрировать сцену (ref controls может появиться на следующем кадре). */
   useEffect(() => {
-    const controls = controlsRef.current;
-    if (!controls) return;
-
-    const perspective = camera as THREE.PerspectiveCamera;
-    const target = new THREE.Vector3(0, 0, 0);
-    const currentActiveObject = activeObjectRef.current;
-    const bounds = currentActiveObject ? new THREE.Box3().setFromObject(currentActiveObject) : null;
-    const hasBounds = Boolean(bounds && !bounds.isEmpty());
-    const size = hasBounds ? bounds!.getSize(new THREE.Vector3()) : new THREE.Vector3(10, 10, 10);
-    if (hasBounds) bounds!.getCenter(target);
-
-    if (viewMode === "2d") {
-      const topSpan = Math.max(size.x, size.z, 1);
-      const fov = THREE.MathUtils.degToRad(Math.max(perspective.fov, 10));
-      const distance = (topSpan * 0.8) / Math.tan(fov / 2) + Math.max(size.y, 1) + 5;
-
-      perspective.up.set(0, 1, 0);
-      perspective.position.set(target.x, target.y + distance, target.z + 0.0001);
-      perspective.lookAt(target);
-      controls.target.copy(target);
-    } else {
-      const maxDim = Math.max(size.x, size.y, size.z, 1);
-      const distance = maxDim * 1.7;
-      const centerY = target.y;
-
-      perspective.up.set(0, 1, 0);
-      perspective.position.set(
-        target.x + distance,
-        centerY + distance * 0.75,
-        target.z + distance,
-      );
-      perspective.lookAt(target.x, centerY, target.z);
-      controls.target.set(target.x, centerY, target.z);
-    }
-
-    controls.update();
-    invalidate();
+    let cancelled = false;
+    let raf = 0;
+    const tryApply = () => {
+      if (cancelled) return;
+      const controls = controlsRef.current;
+      if (!controls) {
+        raf = requestAnimationFrame(tryApply);
+        return;
+      }
+      const perspective = camera as THREE.PerspectiveCamera;
+      const stored = parseStoredViewportCameras()[viewMode];
+      if (stored && isValidStoredViewportCamera(stored)) {
+        perspective.position.set(...stored.position);
+        controls.target.set(...stored.target);
+        perspective.up.set(0, 1, 0);
+        perspective.lookAt(controls.target);
+      } else {
+        applyViewportCameraFrameToFit(
+          perspective,
+          controls,
+          activeObjectRef.current,
+          viewMode,
+        );
+      }
+      controls.update();
+      invalidate();
+    };
+    raf = requestAnimationFrame(tryApply);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+    };
   }, [camera, controlsRef, invalidate, viewMode]);
+
+  /** Сохранять вид при орбите/панорамировании (debounce). */
+  useEffect(() => {
+    let cancelled = false;
+    let raf = 0;
+    let removeListener: (() => void) | null = null;
+
+    const attach = () => {
+      if (cancelled) return;
+      const controls = controlsRef.current;
+      if (!controls) {
+        raf = requestAnimationFrame(attach);
+        return;
+      }
+      const perspective = camera as THREE.PerspectiveCamera;
+      let saveTimer: ReturnType<typeof setTimeout> | null = null;
+      const onChange = () => {
+        if (saveTimer) clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+          persistViewportCamera(viewMode, perspective.position, controls.target);
+          saveTimer = null;
+        }, 280);
+      };
+      controls.addEventListener("change", onChange);
+      removeListener = () => {
+        controls.removeEventListener("change", onChange);
+        if (saveTimer) clearTimeout(saveTimer);
+      };
+    };
+
+    raf = requestAnimationFrame(attach);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      removeListener?.();
+    };
+  }, [camera, controlsRef, viewMode]);
 
   return null;
 }
@@ -2464,13 +2645,18 @@ export default function IfcViewport({
       setDraftPlacement((previous) => {
         const shortest = normalizeAngle(desiredRotation - previous.rotationY);
         if (Math.abs(shortest) < ROTATE_DRAG_DEAD_ZONE) return previous;
-        return {
+        let next: IfcModelItem["placement"] = {
           ...previous,
           rotationY: desiredRotation,
         };
+        if (activeModelId) {
+          next = applyParallelEdgeRotationSnap(next, activeModelId, sceneModelsRef.current);
+        }
+        return next;
       });
     }
   }, [
+    activeModelId,
     applyAlignmentSnap,
     applyParallelFaceMagnetToPlacement,
     rotationSnapEnabled,
@@ -2733,28 +2919,50 @@ export default function IfcViewport({
         }
         candidates.sort((a, b) => a.distSq - b.distSq);
 
-        for (const { distSq, source, target } of candidates) {
-          const gap = Math.sqrt(distSq);
-          if (gap > PROXIMITY_HATCH_DISTANCE) break;
-          // Первая по distSq пара может быть касание угла (gap≈0), а реальный зазор — у другой пары рёбер.
-          if (gap <= 1e-6) continue;
-          if (getParallelDelta(source, target) > PROXIMITY_HATCH_EDGE_TOLERANCE) continue;
-
-          const area = buildProximityHatchArea(
-            source,
-            target,
-            `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}:hatch`,
-          );
-          if (area) {
-            return {
-              ...area,
-              sourceModelId: activeModelId,
-              targetModelId: footprint.id,
-            };
+        // Только ближайшая пара рёбер (минимальный зазор). Иначе при отказе ближайшей по параллели
+        // подсветка перескакивала на дальние «подходящие» рёбра — визуально неинформативно.
+        let closest: (typeof candidates)[0] | null = null;
+        for (const c of candidates) {
+          if (Math.sqrt(c.distSq) > 1e-6) {
+            closest = c;
+            break;
           }
         }
+        if (!closest) return null;
 
-        return null;
+        const { distSq, source, target } = closest;
+        const gap = Math.sqrt(distSq);
+        if (gap > PROXIMITY_HATCH_DISTANCE) return null;
+        if (getParallelDelta(source, target) > PROXIMITY_HATCH_EDGE_TOLERANCE) return null;
+
+        const bridgePts = closestPointsOnSegments2D(
+          source.start,
+          source.end,
+          target.start,
+          target.end,
+        );
+        const gdx = bridgePts.b.x - bridgePts.a.x;
+        const gdz = bridgePts.b.z - bridgePts.a.z;
+        const sdx = source.end.x - source.start.x;
+        const sdz = source.end.z - source.start.z;
+        const slen = Math.hypot(sdx, sdz);
+        if (slen < 1e-9) return null;
+        const ux = sdx / slen;
+        const uz = sdz / slen;
+        const alongEdge = Math.abs(gdx * ux + gdz * uz);
+        if (alongEdge > 0.2 * gap + 1e-7) return null;
+
+        const area = buildProximityHatchArea(
+          source,
+          target,
+          `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}:hatch`,
+        );
+        if (!area) return null;
+        return {
+          ...area,
+          sourceModelId: activeModelId,
+          targetModelId: footprint.id,
+        };
       })
       .filter((area): area is ProximityHatchArea => Boolean(area));
   }, [activeGroundFootprint, activeModelId, isTransforming, sceneGroundFootprints]);
@@ -2829,6 +3037,37 @@ export default function IfcViewport({
 
     return bestHint;
   }, [activeGroundFootprint, activeModelId, isTransforming, sceneGroundFootprints]);
+
+  const rotateParallelEdgeHighlight = useMemo(() => {
+    if (!isTransforming || canvasGesture !== "rotate" || !activeModelId) return null;
+    if (sceneGroundFootprints.length < 2) return null;
+
+    const activeFootprint = sceneGroundFootprints.find((item) => item.id === activeModelId);
+    if (!activeFootprint) return null;
+
+    const activeEdges = getFootprintEdgeSegments(activeFootprint.corners);
+    let bestDistSq = Number.POSITIVE_INFINITY;
+    let bestA: GroundSegment | null = null;
+    let bestB: GroundSegment | null = null;
+
+    for (const other of sceneGroundFootprints) {
+      if (other.id === activeModelId) continue;
+      const otherEdges = getFootprintEdgeSegments(other.corners);
+      for (const sa of activeEdges) {
+        for (const sb of otherEdges) {
+          const bridge = closestPointsOnSegments2D(sa.start, sa.end, sb.start, sb.end);
+          if (bridge.distanceSq >= bestDistSq) continue;
+          bestDistSq = bridge.distanceSq;
+          bestA = sa;
+          bestB = sb;
+        }
+      }
+    }
+
+    if (!bestA || !bestB || !Number.isFinite(bestDistSq)) return null;
+    if (getParallelDelta(bestA, bestB) > ROTATE_PARALLEL_EDGE_HIGHLIGHT_RAD) return null;
+    return { segmentA: bestA, segmentB: bestB };
+  }, [activeModelId, canvasGesture, isTransforming, sceneGroundFootprints]);
 
   const measurementLines = useMemo(() => {
     if (!activeModelId || !isTransforming) return [] as MeasurementLine[];
@@ -3091,6 +3330,49 @@ export default function IfcViewport({
           </group>
         ))}
 
+        {rotateParallelEdgeHighlight ? (
+          <>
+            <lineSegments renderOrder={32}>
+              <bufferGeometry>
+                <bufferAttribute
+                  attach="attributes-position"
+                  args={[
+                    proximitySegmentHighlightLineXZ(
+                      rotateParallelEdgeHighlight.segmentA,
+                      ROTATE_PARALLEL_EDGE_LINE_Y,
+                    ),
+                    3,
+                  ]}
+                />
+              </bufferGeometry>
+              <lineBasicMaterial
+                color={PROXIMITY_HATCH_COLOR}
+                depthTest
+                depthWrite={false}
+              />
+            </lineSegments>
+            <lineSegments renderOrder={32}>
+              <bufferGeometry>
+                <bufferAttribute
+                  attach="attributes-position"
+                  args={[
+                    proximitySegmentHighlightLineXZ(
+                      rotateParallelEdgeHighlight.segmentB,
+                      ROTATE_PARALLEL_EDGE_LINE_Y,
+                    ),
+                    3,
+                  ]}
+                />
+              </bufferGeometry>
+              <lineBasicMaterial
+                color={PROXIMITY_HATCH_COLOR}
+                depthTest
+                depthWrite={false}
+              />
+            </lineSegments>
+          </>
+        ) : null}
+
         {alignmentPlaneHint && (
           <group key={alignmentPlaneHint.id}>
             <AlignmentPlaneHighlight
@@ -3102,12 +3384,6 @@ export default function IfcViewport({
             />
           </group>
         )}
-
-        <CameraController
-          activeObject={activeObject}
-          viewMode={viewMode}
-          controlsRef={controlsRef}
-        />
 
         {viewMode === "3d" ? (
           <OrbitControls
@@ -3130,6 +3406,12 @@ export default function IfcViewport({
             maxPolarAngle={0}
           />
         )}
+
+        <CameraController
+          activeObject={activeObject}
+          viewMode={viewMode}
+          controlsRef={controlsRef}
+        />
       </Canvas>
 
       {overlayText && (
