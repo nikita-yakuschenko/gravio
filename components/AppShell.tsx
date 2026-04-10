@@ -8,6 +8,8 @@ import { useIfcStore } from "@/store/ifcStore";
 import type { IfcModelItem, IfcPlacement } from "@/types/ifc";
 
 const MODEL_DND_MIME = "application/x-gravio-model-id";
+type SidebarTab = "project" | "library";
+const ROTATION_SNAP_STEP_DEGREES = 15;
 
 const IfcViewport = dynamic(() => import("@/components/IfcViewport"), {
   ssr: false,
@@ -48,8 +50,10 @@ function statusTone(model: IfcModelItem): string {
 
 export default function AppShell() {
   const [isDragging, setIsDragging] = useState(false);
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("library");
   const [viewMode, setViewMode] = useState<"2d" | "3d">("3d");
   const [transformMode, setTransformMode] = useState<"translate" | "rotate">("translate");
+  const [rotationSnapEnabled, setRotationSnapEnabled] = useState(true);
 
   const {
     models,
@@ -122,6 +126,10 @@ export default function AppShell() {
     [models],
   );
 
+  const projectModels = useMemo(() => models.filter((model) => model.isPlaced), [models]);
+  const libraryModels = useMemo(() => models.filter((model) => !model.isPlaced), [models]);
+  const sidebarModels = sidebarTab === "project" ? projectModels : libraryModels;
+
   const handleGeometryLoading = useCallback(
     (id: string) => setGeometryStatus(id, "loading"),
     [setGeometryStatus],
@@ -151,6 +159,7 @@ export default function AppShell() {
     (id: string, placement: IfcPlacement) => {
       const instanceId = spawnModelInstance(id, placement);
       if (instanceId) persistModelPlacement(instanceId);
+      if (instanceId) setSidebarTab("project");
       return instanceId;
     },
     [persistModelPlacement, spawnModelInstance],
@@ -211,6 +220,17 @@ export default function AppShell() {
               Rotate
             </button>
           </div>
+          <button
+            className={`rounded border px-2 py-1 text-[11px] transition-colors ${
+              rotationSnapEnabled
+                ? "border-cyan-500/50 bg-cyan-500/15 text-cyan-100"
+                : "border-slate-700 bg-slate-800 text-slate-400 hover:text-slate-200"
+            }`}
+            onClick={() => setRotationSnapEnabled((enabled) => !enabled)}
+            title={`Snap rotation to ${ROTATION_SNAP_STEP_DEGREES} degree steps`}
+          >
+            Snap {ROTATION_SNAP_STEP_DEGREES}°
+          </button>
           {hydrationStatus === "loading" && <span>restoring...</span>}
           <span>{models.length} models</span>
           <span className="text-slate-600">|</span>
@@ -257,6 +277,43 @@ export default function AppShell() {
               </label>
             </div>
 
+            <div className="border-b border-slate-800 p-2">
+              <div
+                className="grid grid-cols-2 rounded-lg border border-slate-800 bg-slate-950/40 p-1"
+                role="tablist"
+                aria-label="Model source"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sidebarTab === "project"}
+                  className={`rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
+                    sidebarTab === "project"
+                      ? "bg-slate-700 text-slate-100"
+                      : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                  }`}
+                  onClick={() => setSidebarTab("project")}
+                >
+                  Проект{" "}
+                  <span className="ml-1 text-slate-400">({projectModels.length})</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sidebarTab === "library"}
+                  className={`rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
+                    sidebarTab === "library"
+                      ? "bg-slate-700 text-slate-100"
+                      : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                  }`}
+                  onClick={() => setSidebarTab("library")}
+                >
+                  Библиотека{" "}
+                  <span className="ml-1 text-slate-400">({libraryModels.length})</span>
+                </button>
+              </div>
+            </div>
+
             <div className="min-h-0 flex-1 overflow-y-auto p-2">
               {models.length === 0 && (
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-xs text-slate-500">
@@ -264,9 +321,18 @@ export default function AppShell() {
                 </div>
               )}
 
+              {models.length > 0 && sidebarModels.length === 0 && (
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-xs text-slate-500">
+                  {sidebarTab === "project"
+                    ? "Перетащите модель из библиотеки на канвас, чтобы добавить ее в проект."
+                    : "В библиотеке пока нет IFC-моделей."}
+                </div>
+              )}
+
               <ul className="space-y-2">
-                {models.map((model) => {
+                {sidebarModels.map((model) => {
                   const isActive = model.id === activeModelId;
+                  const canDragToCanvas = sidebarTab === "library" && !model.isPlaced;
                   return (
                     <li key={model.id}>
                       <button
@@ -275,8 +341,12 @@ export default function AppShell() {
                             ? "border-cyan-400 bg-cyan-500/10"
                             : "border-slate-800 bg-slate-900/60 hover:border-slate-600"
                         }`}
-                        draggable
+                        draggable={canDragToCanvas}
                         onDragStart={(event) => {
+                          if (!canDragToCanvas) {
+                            event.preventDefault();
+                            return;
+                          }
                           event.dataTransfer.effectAllowed = "move";
                           event.dataTransfer.setData(MODEL_DND_MIME, model.id);
                         }}
@@ -333,6 +403,8 @@ export default function AppShell() {
             activeModelId={activeModelId}
             viewMode={viewMode}
             transformMode={transformMode}
+            rotationSnapEnabled={rotationSnapEnabled}
+            rotationSnapStepDegrees={ROTATION_SNAP_STEP_DEGREES}
             onGeometryLoading={handleGeometryLoading}
             onGeometryReady={handleGeometryReady}
             onGeometryError={handleGeometryError}

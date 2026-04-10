@@ -13,6 +13,8 @@ interface Props {
   activeModelId: string | null;
   viewMode: "2d" | "3d";
   transformMode: "translate" | "rotate";
+  rotationSnapEnabled: boolean;
+  rotationSnapStepDegrees: number;
   onGeometryLoading: (id: string) => void;
   onGeometryReady: (id: string, stats: NonNullable<IfcModelItem["geometryStats"]>) => void;
   onGeometryError: (id: string, message: string) => void;
@@ -35,6 +37,16 @@ interface ModelGroundFootprint {
   id: string;
   center: GroundPoint;
   corners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint];
+  minY: number;
+  maxY: number;
+}
+
+type AlignmentEdge = "left" | "right" | "top" | "bottom";
+
+interface GroundSegment {
+  start: GroundPoint;
+  end: GroundPoint;
+  edge: AlignmentEdge;
 }
 
 interface MeasurementLine {
@@ -45,6 +57,36 @@ interface MeasurementLine {
   targetCenter: [number, number, number];
   label: [number, number, number];
   distance: number;
+}
+
+interface AlignmentPlaneHint {
+  id: string;
+  source: GroundSegment;
+  target: GroundSegment;
+  minY: number;
+  maxY: number;
+}
+
+interface ProximityHatchArea {
+  id: string;
+  corners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint];
+  hatchSegments: Array<[GroundPoint, GroundPoint]>;
+}
+
+interface AlignmentSnapTarget {
+  edge: AlignmentEdge;
+  value: number;
+}
+
+interface AlignmentSnapData {
+  activeOffsets: {
+    minX: number;
+    maxX: number;
+    minZ: number;
+    maxZ: number;
+  };
+  xTargets: AlignmentSnapTarget[];
+  zTargets: AlignmentSnapTarget[];
 }
 
 type DragState =
@@ -69,9 +111,16 @@ const ZERO_PLACEMENT: IfcModelItem["placement"] = { x: 0, y: 0, z: 0, rotationY:
 const MOVE_DRAG_SENSITIVITY = 0.24;
 const MOVE_DRAG_MAX_STEP = 0.45;
 const MOVE_DRAG_DEAD_ZONE = 0.003;
-const ROTATE_DRAG_SENSITIVITY = 0.18;
-const ROTATE_DRAG_MAX_STEP = THREE.MathUtils.degToRad(1.75);
+const ROTATE_DRAG_SENSITIVITY = 1;
 const ROTATE_DRAG_DEAD_ZONE = THREE.MathUtils.degToRad(0.08);
+const PARALLEL_EDGE_TOLERANCE = THREE.MathUtils.degToRad(0.75);
+const PROXIMITY_HATCH_EDGE_TOLERANCE = THREE.MathUtils.degToRad(3);
+const ALIGNMENT_SNAP_DISTANCE = 0.35;
+const EDGE_ALIGNMENT_TOLERANCE = 0.03;
+const ALIGNMENT_PLANE_COLOR = "#ec4899";
+const PROXIMITY_HATCH_DISTANCE = 6;
+const PROXIMITY_HATCH_STEP = 0.35;
+const PROXIMITY_HATCH_COLOR = "#ec4899";
 
 function normalizeAngle(angle: number): number {
   let value = angle;
@@ -126,6 +175,8 @@ function updateSelectionBounds(object: THREE.Group) {
     return {
       minX: -1,
       maxX: 1,
+      minY: 0,
+      maxY: 2.5,
       minZ: -1,
       maxZ: 1,
     };
@@ -133,6 +184,8 @@ function updateSelectionBounds(object: THREE.Group) {
   return {
     minX: bounds.min.x,
     maxX: bounds.max.x,
+    minY: bounds.min.y,
+    maxY: bounds.max.y,
     minZ: bounds.min.z,
     maxZ: bounds.max.z,
   };
@@ -159,6 +212,134 @@ function getFootprintSegments(
     [corners[2], corners[3]],
     [corners[3], corners[0]],
   ];
+}
+
+function getFootprintEdgeSegments(
+  corners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint],
+): GroundSegment[] {
+  return [
+    { edge: "top", start: corners[0], end: corners[1] },
+    { edge: "right", start: corners[1], end: corners[2] },
+    { edge: "bottom", start: corners[2], end: corners[3] },
+    { edge: "left", start: corners[3], end: corners[0] },
+  ];
+}
+
+function getSegmentAngle(segment: GroundSegment): number {
+  return Math.atan2(segment.end.z - segment.start.z, segment.end.x - segment.start.x);
+}
+
+function getParallelDelta(a: GroundSegment, b: GroundSegment): number {
+  const diff = Math.abs(normalizeAngle(getSegmentAngle(a) - getSegmentAngle(b)));
+  return Math.min(diff, Math.abs(Math.PI - diff));
+}
+
+function getParallelLineDistance(a: GroundSegment, b: GroundSegment): number {
+  const dx = a.end.x - a.start.x;
+  const dz = a.end.z - a.start.z;
+  const length = Math.hypot(dx, dz);
+  if (length < 1e-6) return Number.POSITIVE_INFINITY;
+  return Math.abs((b.start.x - a.start.x) * dz - (b.start.z - a.start.z) * dx) / length;
+}
+
+function buildProximityHatchArea(
+  source: GroundSegment,
+  target: GroundSegment,
+  id: string,
+): ProximityHatchArea | null {
+  const dx = source.end.x - source.start.x;
+  const dz = source.end.z - source.start.z;
+  const length = Math.hypot(dx, dz);
+  if (!Number.isFinite(length) || length < 1e-6) return null;
+
+  const ux = dx / length;
+  const uz = dz / length;
+  const normalX = -uz;
+  const normalZ = ux;
+  const project = (point: GroundPoint) =>
+    (point.x - source.start.x) * ux + (point.z - source.start.z) * uz;
+
+  const sourceStart = project(source.start);
+  const sourceEnd = project(source.end);
+  const targetStart = project(target.start);
+  const targetEnd = project(target.end);
+  const overlapStart = Math.max(
+    Math.min(sourceStart, sourceEnd),
+    Math.min(targetStart, targetEnd),
+  );
+  const overlapEnd = Math.min(
+    Math.max(sourceStart, sourceEnd),
+    Math.max(targetStart, targetEnd),
+  );
+  if (overlapEnd - overlapStart < 0.2) return null;
+
+  const signedOffset =
+    (target.start.x - source.start.x) * normalX +
+    (target.start.z - source.start.z) * normalZ;
+  const gapDistance = Math.abs(signedOffset);
+  if (gapDistance < 0.01 || gapDistance > PROXIMITY_HATCH_DISTANCE) return null;
+
+  const pointOnSource = (value: number): GroundPoint => ({
+    x: source.start.x + ux * value,
+    z: source.start.z + uz * value,
+  });
+  const pointOnTarget = (value: number): GroundPoint => ({
+    x: source.start.x + ux * value + normalX * signedOffset,
+    z: source.start.z + uz * value + normalZ * signedOffset,
+  });
+
+  const a = pointOnSource(overlapStart);
+  const b = pointOnSource(overlapEnd);
+  const c = pointOnTarget(overlapEnd);
+  const d = pointOnTarget(overlapStart);
+
+  const hatchSegments: Array<[GroundPoint, GroundPoint]> = [];
+  const segmentLength = overlapEnd - overlapStart;
+  const signedStep = Math.sign(signedOffset || 1) * PROXIMITY_HATCH_STEP;
+  const count = Math.ceil((segmentLength + gapDistance) / PROXIMITY_HATCH_STEP);
+
+  for (let index = -count; index <= count; index += 1) {
+    const startValue = overlapStart + index * PROXIMITY_HATCH_STEP;
+    const endValue = startValue + Math.abs(signedOffset);
+    const clippedStart = THREE.MathUtils.clamp(startValue, overlapStart, overlapEnd);
+    const clippedEnd = THREE.MathUtils.clamp(endValue, overlapStart, overlapEnd);
+    if (clippedEnd - clippedStart < 0.05) continue;
+
+    const sourcePoint = pointOnSource(clippedStart);
+    const targetPoint = {
+      x: source.start.x + ux * clippedEnd + normalX * signedOffset,
+      z: source.start.z + uz * clippedEnd + normalZ * signedOffset,
+    };
+
+    if (signedStep < 0) {
+      hatchSegments.push([targetPoint, sourcePoint]);
+    } else {
+      hatchSegments.push([sourcePoint, targetPoint]);
+    }
+  }
+
+  return { id, corners: [a, b, c, d], hatchSegments };
+}
+
+function getFootprintExtents(footprint: ModelGroundFootprint) {
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+
+  for (const corner of footprint.corners) {
+    minX = Math.min(minX, corner.x);
+    maxX = Math.max(maxX, corner.x);
+    minZ = Math.min(minZ, corner.z);
+    maxZ = Math.max(maxZ, corner.z);
+  }
+
+  return { minX, maxX, minZ, maxZ };
+}
+
+function snapAngle(angle: number, step: number): number {
+  if (!Number.isFinite(step) || step <= 0) return angle;
+  return normalizeAngle(Math.round(angle / step) * step);
 }
 
 function cross2D(a: GroundPoint, b: GroundPoint, c: GroundPoint): number {
@@ -348,6 +529,150 @@ function RotateCornerHandle({
   );
 }
 
+function AlignmentPlaneHighlight({
+  source,
+  target,
+  minY,
+  maxY,
+}: {
+  source: GroundSegment;
+  target: GroundSegment;
+  minY: number;
+  maxY: number;
+}) {
+  const positions = useMemo(() => {
+    const dx = source.end.x - source.start.x;
+    const dz = source.end.z - source.start.z;
+    const length = Math.hypot(dx, dz);
+    if (!Number.isFinite(length) || length < 1e-6) return new Float32Array();
+
+    const ux = dx / length;
+    const uz = dz / length;
+    const normalX = -uz;
+    const normalZ = ux;
+    const signedOffset =
+      (target.start.x - source.start.x) * normalX +
+      (target.start.z - source.start.z) * normalZ;
+    const baseX = source.start.x + normalX * signedOffset * 0.5;
+    const baseZ = source.start.z + normalZ * signedOffset * 0.5;
+
+    const project = (point: GroundPoint) =>
+      (point.x - baseX) * ux + (point.z - baseZ) * uz;
+    const values = [
+      project(source.start),
+      project(source.end),
+      project(target.start),
+      project(target.end),
+    ];
+    const minProjection = Math.min(...values);
+    const maxProjection = Math.max(...values);
+    const y0 = Number.isFinite(minY) ? minY : 0;
+    const y1 = Math.max(Number.isFinite(maxY) ? maxY : 2.5, y0 + 0.2);
+
+    const startX = baseX + ux * minProjection;
+    const startZ = baseZ + uz * minProjection;
+    const endX = baseX + ux * maxProjection;
+    const endZ = baseZ + uz * maxProjection;
+
+    return new Float32Array([
+      startX,
+      y0,
+      startZ,
+      endX,
+      y0,
+      endZ,
+      endX,
+      y1,
+      endZ,
+      startX,
+      y0,
+      startZ,
+      endX,
+      y1,
+      endZ,
+      startX,
+      y1,
+      startZ,
+    ]);
+  }, [maxY, minY, source, target]);
+
+  if (positions.length === 0) return null;
+
+  return (
+    <mesh renderOrder={30}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" args={[positions, 3]} />
+      </bufferGeometry>
+      <meshBasicMaterial
+        color={ALIGNMENT_PLANE_COLOR}
+        opacity={0.2}
+        side={THREE.DoubleSide}
+        transparent
+      />
+    </mesh>
+  );
+}
+
+function ProximityHatchOverlay({ area }: { area: ProximityHatchArea }) {
+  const fillPositions = useMemo(() => {
+    const [a, b, c, d] = area.corners;
+    const y = 0.055;
+    return new Float32Array([
+      a.x,
+      y,
+      a.z,
+      b.x,
+      y,
+      b.z,
+      c.x,
+      y,
+      c.z,
+      a.x,
+      y,
+      a.z,
+      c.x,
+      y,
+      c.z,
+      d.x,
+      y,
+      d.z,
+    ]);
+  }, [area.corners]);
+
+  const hatchPositions = useMemo(() => {
+    const y = 0.065;
+    const values: number[] = [];
+    for (const [start, end] of area.hatchSegments) {
+      values.push(start.x, y, start.z, end.x, y, end.z);
+    }
+    return new Float32Array(values);
+  }, [area.hatchSegments]);
+
+  return (
+    <group renderOrder={20}>
+      <mesh>
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" args={[fillPositions, 3]} />
+        </bufferGeometry>
+        <meshBasicMaterial
+          color={PROXIMITY_HATCH_COLOR}
+          opacity={0.09}
+          side={THREE.DoubleSide}
+          transparent
+        />
+      </mesh>
+      {hatchPositions.length > 0 && (
+        <lineSegments>
+          <bufferGeometry>
+            <bufferAttribute attach="attributes-position" args={[hatchPositions, 3]} />
+          </bufferGeometry>
+          <lineBasicMaterial color={PROXIMITY_HATCH_COLOR} opacity={0.45} transparent />
+        </lineSegments>
+      )}
+    </group>
+  );
+}
+
 function CameraController({
   activeObject,
   viewMode,
@@ -414,6 +739,8 @@ export default function IfcViewport({
   activeModelId,
   viewMode,
   transformMode,
+  rotationSnapEnabled,
+  rotationSnapStepDegrees,
   onGeometryLoading,
   onGeometryReady,
   onGeometryError,
@@ -435,6 +762,7 @@ export default function IfcViewport({
   const cameraRef = useRef<THREE.Camera | null>(null);
   const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
   const raycasterRef = useRef(new THREE.Raycaster());
+  const alignmentSnapRef = useRef<AlignmentSnapData | null>(null);
   const instanceObjectsRef = useRef<Map<string, { geometryKey: string; object: THREE.Group }>>(
     new Map(),
   );
@@ -641,6 +969,49 @@ export default function IfcViewport({
     [activeModelId, setCameraControlsEnabled],
   );
 
+  const applyAlignmentSnap = useCallback((placement: IfcModelItem["placement"]) => {
+    const data = alignmentSnapRef.current;
+    if (!data) return placement;
+
+    let x = placement.x;
+    let z = placement.z;
+
+    let bestXDelta = 0;
+    let bestXDistance = ALIGNMENT_SNAP_DISTANCE;
+    for (const activeEdge of [
+      { edge: "left", value: x + data.activeOffsets.minX },
+      { edge: "right", value: x + data.activeOffsets.maxX },
+    ] satisfies AlignmentSnapTarget[]) {
+      for (const target of data.xTargets) {
+        const delta = target.value - activeEdge.value;
+        const distance = Math.abs(delta);
+        if (distance >= bestXDistance) continue;
+        bestXDistance = distance;
+        bestXDelta = delta;
+      }
+    }
+    x += bestXDelta;
+
+    let bestZDelta = 0;
+    let bestZDistance = ALIGNMENT_SNAP_DISTANCE;
+    for (const activeEdge of [
+      { edge: "top", value: z + data.activeOffsets.minZ },
+      { edge: "bottom", value: z + data.activeOffsets.maxZ },
+    ] satisfies AlignmentSnapTarget[]) {
+      for (const target of data.zTargets) {
+        const delta = target.value - activeEdge.value;
+        const distance = Math.abs(delta);
+        if (distance >= bestZDistance) continue;
+        bestZDistance = distance;
+        bestZDelta = delta;
+      }
+    }
+    z += bestZDelta;
+
+    if (x === placement.x && z === placement.z) return placement;
+    return { ...placement, x, z };
+  }, []);
+
   const handlePointerMove = useCallback((event: ThreeEvent<PointerEvent>) => {
     const drag = dragStateRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
@@ -674,34 +1045,35 @@ export default function IfcViewport({
               );
 
         if (nextDx === 0 && nextDz === 0) return previous;
-        return {
+        return applyAlignmentSnap({
           ...previous,
           x: previous.x + nextDx,
           y: 0,
           z: previous.z + nextDz,
-        };
+        });
       });
     } else {
       const angle = Math.atan2(point.z - drag.centerZ, point.x - drag.centerX);
       const delta = normalizeAngle(angle - drag.startAngle);
-      const desiredRotation = normalizeAngle(
+      let desiredRotation = normalizeAngle(
         drag.startRotation - delta * ROTATE_DRAG_SENSITIVITY,
       );
+      if (rotationSnapEnabled) {
+        desiredRotation = snapAngle(
+          desiredRotation,
+          THREE.MathUtils.degToRad(rotationSnapStepDegrees),
+        );
+      }
       setDraftPlacement((previous) => {
         const shortest = normalizeAngle(desiredRotation - previous.rotationY);
         if (Math.abs(shortest) < ROTATE_DRAG_DEAD_ZONE) return previous;
-        const step = THREE.MathUtils.clamp(
-          shortest,
-          -ROTATE_DRAG_MAX_STEP,
-          ROTATE_DRAG_MAX_STEP,
-        );
         return {
           ...previous,
-          rotationY: normalizeAngle(previous.rotationY + step),
+          rotationY: desiredRotation,
         };
       });
     }
-  }, []);
+  }, [applyAlignmentSnap, rotationSnapEnabled, rotationSnapStepDegrees]);
 
   const endDrag = useCallback((event: ThreeEvent<PointerEvent>) => {
     const drag = dragStateRef.current;
@@ -868,10 +1240,129 @@ export default function IfcViewport({
           id: sceneModel.id,
           center: { x: placement.x, z: placement.z },
           corners,
+          minY: bounds.minY + placement.y,
+          maxY: bounds.maxY + placement.y,
         } satisfies ModelGroundFootprint;
       })
       .filter((value): value is ModelGroundFootprint => Boolean(value));
   }, [activeModelId, draftPlacement, sceneModels]);
+
+  const activeGroundFootprint = useMemo(
+    () => sceneGroundFootprints.find((item) => item.id === activeModelId) ?? null,
+    [activeModelId, sceneGroundFootprints],
+  );
+
+  useEffect(() => {
+    if (!activeModelId || !activeGroundFootprint) {
+      alignmentSnapRef.current = null;
+      return;
+    }
+
+    const activeExtents = getFootprintExtents(activeGroundFootprint);
+    const xTargets: AlignmentSnapTarget[] = [];
+    const zTargets: AlignmentSnapTarget[] = [];
+
+    for (const footprint of sceneGroundFootprints) {
+      if (footprint.id === activeModelId) continue;
+      const extents = getFootprintExtents(footprint);
+      xTargets.push(
+        { edge: "left", value: extents.minX },
+        { edge: "right", value: extents.maxX },
+      );
+      zTargets.push(
+        { edge: "top", value: extents.minZ },
+        { edge: "bottom", value: extents.maxZ },
+      );
+    }
+
+    alignmentSnapRef.current = {
+      activeOffsets: {
+        minX: activeExtents.minX - activeGroundFootprint.center.x,
+        maxX: activeExtents.maxX - activeGroundFootprint.center.x,
+        minZ: activeExtents.minZ - activeGroundFootprint.center.z,
+        maxZ: activeExtents.maxZ - activeGroundFootprint.center.z,
+      },
+      xTargets,
+      zTargets,
+    };
+  }, [activeGroundFootprint, activeModelId, sceneGroundFootprints]);
+
+  const proximityHatchAreas = useMemo(() => {
+    if (!activeModelId || !activeGroundFootprint || !isTransforming) {
+      return [] as ProximityHatchArea[];
+    }
+
+    const activeEdges = getFootprintEdgeSegments(activeGroundFootprint.corners);
+
+    return sceneGroundFootprints
+      .filter((footprint) => footprint.id !== activeModelId)
+      .map((footprint) => {
+        let bestArea: ProximityHatchArea | null = null;
+        let bestScore = Number.POSITIVE_INFINITY;
+
+        for (const source of activeEdges) {
+          for (const target of getFootprintEdgeSegments(footprint.corners)) {
+            if (getParallelDelta(source, target) > PROXIMITY_HATCH_EDGE_TOLERANCE) continue;
+            const area = buildProximityHatchArea(
+              source,
+              target,
+              `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}:hatch`,
+            );
+            if (!area) continue;
+
+            const score = getParallelLineDistance(source, target);
+            if (score >= bestScore) continue;
+            bestScore = score;
+            bestArea = area;
+          }
+        }
+
+        return bestArea;
+      })
+      .filter((area): area is ProximityHatchArea => Boolean(area));
+  }, [activeGroundFootprint, activeModelId, isTransforming, sceneGroundFootprints]);
+
+  const alignmentPlaneHint = useMemo(() => {
+    if (!activeModelId || !activeGroundFootprint || !isTransforming) {
+      return null as AlignmentPlaneHint | null;
+    }
+
+    const activeEdges = getFootprintEdgeSegments(activeGroundFootprint.corners);
+    let bestHint: AlignmentPlaneHint | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const footprint of sceneGroundFootprints) {
+      if (footprint.id === activeModelId) continue;
+
+      for (const source of activeEdges) {
+        for (const target of getFootprintEdgeSegments(footprint.corners)) {
+          if (getParallelDelta(source, target) > PARALLEL_EDGE_TOLERANCE) continue;
+          const lineDistance = getParallelLineDistance(source, target);
+          if (lineDistance > EDGE_ALIGNMENT_TOLERANCE) continue;
+
+          const closest = closestPointsOnSegments2D(
+            source.start,
+            source.end,
+            target.start,
+            target.end,
+          );
+          const score = lineDistance + closest.distanceSq * 0.001;
+          if (score >= bestScore) continue;
+
+          bestScore = score;
+          bestHint = {
+            id: `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}`,
+            source,
+            target,
+            minY: Math.min(activeGroundFootprint.minY, footprint.minY),
+            maxY: Math.max(activeGroundFootprint.maxY, footprint.maxY),
+          };
+        }
+      }
+    }
+
+    return bestHint;
+  }, [activeGroundFootprint, activeModelId, isTransforming, sceneGroundFootprints]);
 
   const measurementLines = useMemo(() => {
     if (!activeModelId || !isTransforming) return [] as MeasurementLine[];
@@ -1123,6 +1614,10 @@ export default function IfcViewport({
           );
         })}
 
+        {proximityHatchAreas.map((area) => (
+          <ProximityHatchOverlay key={area.id} area={area} />
+        ))}
+
         {measurementLines.map((line) => (
           <group key={line.id}>
             <line>
@@ -1172,6 +1667,17 @@ export default function IfcViewport({
             </Html>
           </group>
         ))}
+
+        {alignmentPlaneHint && (
+          <group key={alignmentPlaneHint.id}>
+            <AlignmentPlaneHighlight
+              maxY={alignmentPlaneHint.maxY}
+              minY={alignmentPlaneHint.minY}
+              source={alignmentPlaneHint.source}
+              target={alignmentPlaneHint.target}
+            />
+          </group>
+        )}
 
         <CameraController
           activeObject={activeObject}
