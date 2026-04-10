@@ -1,41 +1,13 @@
 import type { IfcModelItem } from "@/types/ifc";
 import { VIEWPORT_OUTDOOR_SPEC } from "@/lib/viewportOutdoorSpec";
-import type { ArchitecturalModelDetail } from "@/lib/nanoBananaArchitecturalDetail";
+import { buildNanoBananaSceneReconstructionBlock } from "@/lib/nanoBananaSceneReconstruction";
+import type {
+  BuildNanoBananaPromptInput,
+  NanoBananaCameraSnapshot,
+  PlacedModelSnapshot,
+} from "@/lib/nanoBananaTypes";
 
-export type NanoBananaCameraSnapshot = {
-  position: [number, number, number];
-  target: [number, number, number];
-  up: [number, number, number];
-  quaternion: [number, number, number, number];
-  fovDeg: number;
-  aspect: number;
-  near: number;
-  far: number;
-  zoom: number;
-};
-
-export type PlacedModelSnapshot = {
-  id: string;
-  name: string;
-  placement: {
-    x: number;
-    y: number;
-    z: number;
-    rotationYRad: number;
-    rotationYDeg: number;
-  };
-};
-
-export type BuildNanoBananaPromptInput = {
-  viewMode: "2d" | "3d";
-  camera: NanoBananaCameraSnapshot | null;
-  canvasCssWidth: number;
-  canvasCssHeight: number;
-  placedModels: PlacedModelSnapshot[];
-  architecturalModels: ArchitecturalModelDetail[];
-  /** Если камера ещё не готова */
-  error?: string;
-};
+export type { BuildNanoBananaPromptInput, NanoBananaCameraSnapshot, PlacedModelSnapshot };
 
 function round6(n: number): number {
   return Math.round(n * 1e6) / 1e6;
@@ -43,7 +15,7 @@ function round6(n: number): number {
 
 /**
  * Детальный JSON для генераторов изображений (в т.ч. NanoBanana): камера 1:1 с вьюпортом,
- * освещение/трава как в Gravio + текстовые инструкции для «живой» фотореалистичной сцены.
+ * освещение/трава как в Gravio, архитектурные данные + блок NanoBananaSceneReconstruction.
  */
 export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): string {
   const spec = VIEWPORT_OUTDOOR_SPEC;
@@ -104,39 +76,47 @@ export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): st
     intent: "nanoBanana_image_generation",
     instructionsRu: [
       "Сгенерируй одно изображение: фотореалистичный рендер архитектурной сцены.",
-      "Камера, кадр и перспектива должны совпадать с блоком camera (позиция, target, FOV, aspect) — без сдвига и без другого угла.",
+      "Камера, кадр и перспектива должны совпадать с блоком camera / nanoBananaSceneReconstruction.camera — без сдвига и без другого угла.",
       "Окружение: живое наружное освещение днём, лёгкая дымка на горизонте, трава на земле, небо светло-голубое, как в environment.",
       "Архитектура: для каждого объекта в scene.architecturalModels используй численные габариты, след на земле, высоту, данные IFC (стены/окна/двери) и поля reconstructionPromptRu/en — здания должны быть визуально неотличимы по масштабу, пропорциям и характеру от эталона.",
+      "Секция nanoBananaSceneReconstruction: следуй objective, strict_requirements, narrative_guide и creative_enhancement — допускается живой антураж (деревья, участок), но без изменения дома и камеры.",
       "Не упрощай модели до коробок: сохраняй сложность, соответствующую числу треугольников в geometryMesh.",
       "Не добавляй логотипы и водяные знаки.",
     ],
     instructionsEn: [
       "Generate one photorealistic architectural render.",
-      "Match the camera block exactly (position, look-at target, vertical FOV, aspect) — identical framing.",
+      "Match the camera blocks exactly (gravio viewport + nanoBananaSceneReconstruction.camera) — identical framing.",
       "Environment: outdoor daylight, soft atmospheric haze, grass ground, pale blue sky as in environment.",
-      "Architecture: for each entry in scene.architecturalModels follow numeric dimensions, ground footprint, height, IFC counts, and reconstructionPromptRu/en — buildings must match reference scale, proportions, and character.",
+      "Architecture: follow scene.architecturalModels numeric data and reconstruction prompts.",
+      "Use nanoBananaSceneReconstruction (objective, strict_requirements, narrative_guide, creative_enhancement) for lived-in plot enrichment (trees, plants) without altering buildings or camera.",
       "Do not reduce buildings to primitive boxes; preserve detail consistent with triangle counts in geometryMesh.",
       "No logos or watermarks.",
     ],
   };
 
+  const nanoBananaSceneReconstruction = buildNanoBananaSceneReconstructionBlock(input);
+
   const payload = {
+    ...nanoBananaSceneReconstruction,
     meta: {
       generator: "NanoBanana",
       sourceApp: "Gravio",
-      schemaVersion: 2,
+      schemaVersion: 3,
       exportedAt: new Date().toISOString(),
       viewMode: input.viewMode,
+      note: "Корневые поля prompt_type … render_style — шаблон сцены; блок gravio — детали вьюпорта.",
     },
-    environment: env,
-    camera: cameraBlock,
-    scene: {
-      units: "meters",
-      placedModels: input.placedModels,
-      architecturalModels: input.architecturalModels,
-      reconstruction,
+    gravio: {
+      environment: env,
+      camera_detail: cameraBlock,
+      scene: {
+        units: "meters",
+        placedModels: input.placedModels,
+        architecturalModels: input.architecturalModels,
+        reconstruction,
+      },
+      generation,
     },
-    generation,
   };
 
   return JSON.stringify(payload, null, 2);
