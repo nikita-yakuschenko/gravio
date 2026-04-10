@@ -63,6 +63,7 @@ interface AlignmentPlaneHint {
   id: string;
   source: GroundSegment;
   target: GroundSegment;
+  spanPoints: GroundPoint[];
   minY: number;
   maxY: number;
 }
@@ -242,6 +243,45 @@ function getParallelLineDistance(a: GroundSegment, b: GroundSegment): number {
   return Math.abs((b.start.x - a.start.x) * dz - (b.start.z - a.start.z) * dx) / length;
 }
 
+function getPointLineProjection(point: GroundPoint, line: GroundSegment) {
+  const dx = line.end.x - line.start.x;
+  const dz = line.end.z - line.start.z;
+  const length = Math.hypot(dx, dz);
+  if (!Number.isFinite(length) || length < 1e-6) return null;
+
+  const ux = dx / length;
+  const uz = dz / length;
+  const projection = (point.x - line.start.x) * ux + (point.z - line.start.z) * uz;
+  const projectedPoint = {
+    x: line.start.x + ux * projection,
+    z: line.start.z + uz * projection,
+  };
+  const distance = Math.hypot(point.x - projectedPoint.x, point.z - projectedPoint.z);
+
+  return { distance, length, projectedPoint, projection, ux, uz };
+}
+
+function buildProjectedPointSegment(
+  point: GroundPoint,
+  line: GroundSegment,
+): GroundSegment | null {
+  const projection = getPointLineProjection(point, line);
+  if (!projection) return null;
+
+  const halfLength = 0.25;
+  return {
+    edge: line.edge,
+    start: {
+      x: projection.projectedPoint.x - projection.ux * halfLength,
+      z: projection.projectedPoint.z - projection.uz * halfLength,
+    },
+    end: {
+      x: projection.projectedPoint.x + projection.ux * halfLength,
+      z: projection.projectedPoint.z + projection.uz * halfLength,
+    },
+  };
+}
+
 function buildProximityHatchArea(
   source: GroundSegment,
   target: GroundSegment,
@@ -263,15 +303,24 @@ function buildProximityHatchArea(
   const sourceEnd = project(source.end);
   const targetStart = project(target.start);
   const targetEnd = project(target.end);
+  const sourceMin = Math.min(sourceStart, sourceEnd);
+  const sourceMax = Math.max(sourceStart, sourceEnd);
+  const targetMin = Math.min(targetStart, targetEnd);
+  const targetMax = Math.max(targetStart, targetEnd);
   const overlapStart = Math.max(
-    Math.min(sourceStart, sourceEnd),
-    Math.min(targetStart, targetEnd),
+    sourceMin,
+    targetMin,
   );
   const overlapEnd = Math.min(
-    Math.max(sourceStart, sourceEnd),
-    Math.max(targetStart, targetEnd),
+    sourceMax,
+    targetMax,
   );
   if (overlapEnd - overlapStart < 0.2) return null;
+
+  const sourceSpan = sourceMax - sourceMin;
+  const targetSpan = targetMax - targetMin;
+  const hatchStart = sourceSpan >= targetSpan ? sourceMin : targetMin;
+  const hatchEnd = sourceSpan >= targetSpan ? sourceMax : targetMax;
 
   const signedOffset =
     (target.start.x - source.start.x) * normalX +
@@ -288,34 +337,87 @@ function buildProximityHatchArea(
     z: source.start.z + uz * value + normalZ * signedOffset,
   });
 
-  const a = pointOnSource(overlapStart);
-  const b = pointOnSource(overlapEnd);
-  const c = pointOnTarget(overlapEnd);
-  const d = pointOnTarget(overlapStart);
+  const a = pointOnSource(hatchStart);
+  const b = pointOnSource(hatchEnd);
+  const c = pointOnTarget(hatchEnd);
+  const d = pointOnTarget(hatchStart);
 
   const hatchSegments: Array<[GroundPoint, GroundPoint]> = [];
-  const segmentLength = overlapEnd - overlapStart;
-  const signedStep = Math.sign(signedOffset || 1) * PROXIMITY_HATCH_STEP;
-  const count = Math.ceil((segmentLength + gapDistance) / PROXIMITY_HATCH_STEP);
+  const offsetSign = Math.sign(signedOffset);
+  const offsetMin = Math.min(0, signedOffset);
+  const offsetMax = Math.max(0, signedOffset);
+  const localToWorld = (projection: number, offset: number): GroundPoint => ({
+    x: source.start.x + ux * projection + normalX * offset,
+    z: source.start.z + uz * projection + normalZ * offset,
+  });
+  const minKey = Math.min(
+    hatchStart - offsetSign * offsetMin,
+    hatchStart - offsetSign * offsetMax,
+    hatchEnd - offsetSign * offsetMin,
+    hatchEnd - offsetSign * offsetMax,
+  );
+  const maxKey = Math.max(
+    hatchStart - offsetSign * offsetMin,
+    hatchStart - offsetSign * offsetMax,
+    hatchEnd - offsetSign * offsetMin,
+    hatchEnd - offsetSign * offsetMax,
+  );
 
-  for (let index = -count; index <= count; index += 1) {
-    const startValue = overlapStart + index * PROXIMITY_HATCH_STEP;
-    const endValue = startValue + Math.abs(signedOffset);
-    const clippedStart = THREE.MathUtils.clamp(startValue, overlapStart, overlapEnd);
-    const clippedEnd = THREE.MathUtils.clamp(endValue, overlapStart, overlapEnd);
-    if (clippedEnd - clippedStart < 0.05) continue;
-
-    const sourcePoint = pointOnSource(clippedStart);
-    const targetPoint = {
-      x: source.start.x + ux * clippedEnd + normalX * signedOffset,
-      z: source.start.z + uz * clippedEnd + normalZ * signedOffset,
+  for (
+    let key = minKey - PROXIMITY_HATCH_STEP;
+    key <= maxKey + PROXIMITY_HATCH_STEP;
+    key += PROXIMITY_HATCH_STEP
+  ) {
+    const intersections: Array<{ projection: number; offset: number }> = [];
+    const addIntersection = (projection: number, offset: number) => {
+      if (
+        projection < hatchStart - 1e-6 ||
+        projection > hatchEnd + 1e-6 ||
+        offset < offsetMin - 1e-6 ||
+        offset > offsetMax + 1e-6
+      ) {
+        return;
+      }
+      if (
+        intersections.some(
+          (item) =>
+            Math.abs(item.projection - projection) < 1e-5 &&
+            Math.abs(item.offset - offset) < 1e-5,
+        )
+      ) {
+        return;
+      }
+      intersections.push({ projection, offset });
     };
 
-    if (signedStep < 0) {
-      hatchSegments.push([targetPoint, sourcePoint]);
-    } else {
-      hatchSegments.push([sourcePoint, targetPoint]);
+    addIntersection(hatchStart, offsetSign * (hatchStart - key));
+    addIntersection(hatchEnd, offsetSign * (hatchEnd - key));
+    addIntersection(key + offsetSign * offsetMin, offsetMin);
+    addIntersection(key + offsetSign * offsetMax, offsetMax);
+
+    if (intersections.length < 2) continue;
+
+    let start = intersections[0];
+    let end = intersections[1];
+    let bestDistance = -1;
+    for (let first = 0; first < intersections.length; first += 1) {
+      for (let second = first + 1; second < intersections.length; second += 1) {
+        const distance = Math.hypot(
+          intersections[first].projection - intersections[second].projection,
+          intersections[first].offset - intersections[second].offset,
+        );
+        if (distance <= bestDistance) continue;
+        bestDistance = distance;
+        start = intersections[first];
+        end = intersections[second];
+      }
     }
+
+    if (bestDistance < 0.05) continue;
+    hatchSegments.push([
+      localToWorld(start.projection, start.offset),
+      localToWorld(end.projection, end.offset),
+    ]);
   }
 
   return { id, corners: [a, b, c, d], hatchSegments };
@@ -532,11 +634,13 @@ function RotateCornerHandle({
 function AlignmentPlaneHighlight({
   source,
   target,
+  spanPoints,
   minY,
   maxY,
 }: {
   source: GroundSegment;
   target: GroundSegment;
+  spanPoints: GroundPoint[];
   minY: number;
   maxY: number;
 }) {
@@ -558,12 +662,10 @@ function AlignmentPlaneHighlight({
 
     const project = (point: GroundPoint) =>
       (point.x - baseX) * ux + (point.z - baseZ) * uz;
-    const values = [
-      project(source.start),
-      project(source.end),
-      project(target.start),
-      project(target.end),
-    ];
+    const points = spanPoints.length > 0
+      ? spanPoints
+      : [source.start, source.end, target.start, target.end];
+    const values = points.map(project);
     const minProjection = Math.min(...values);
     const maxProjection = Math.max(...values);
     const y0 = Number.isFinite(minY) ? minY : 0;
@@ -594,7 +696,7 @@ function AlignmentPlaneHighlight({
       y1,
       startZ,
     ]);
-  }, [maxY, minY, source, target]);
+  }, [maxY, minY, source, spanPoints, target]);
 
   if (positions.length === 0) return null;
 
@@ -605,6 +707,8 @@ function AlignmentPlaneHighlight({
       </bufferGeometry>
       <meshBasicMaterial
         color={ALIGNMENT_PLANE_COLOR}
+        depthTest={false}
+        depthWrite={false}
         opacity={0.2}
         side={THREE.DoubleSide}
         transparent
@@ -648,6 +752,37 @@ function ProximityHatchOverlay({ area }: { area: ProximityHatchArea }) {
     return new Float32Array(values);
   }, [area.hatchSegments]);
 
+  const outlinePositions = useMemo(() => {
+    const [a, b, c, d] = area.corners;
+    const y = 0.075;
+    return new Float32Array([
+      a.x,
+      y,
+      a.z,
+      b.x,
+      y,
+      b.z,
+      b.x,
+      y,
+      b.z,
+      c.x,
+      y,
+      c.z,
+      c.x,
+      y,
+      c.z,
+      d.x,
+      y,
+      d.z,
+      d.x,
+      y,
+      d.z,
+      a.x,
+      y,
+      a.z,
+    ]);
+  }, [area.corners]);
+
   return (
     <group renderOrder={20}>
       <mesh>
@@ -669,6 +804,12 @@ function ProximityHatchOverlay({ area }: { area: ProximityHatchArea }) {
           <lineBasicMaterial color={PROXIMITY_HATCH_COLOR} opacity={0.45} transparent />
         </lineSegments>
       )}
+      <lineSegments>
+        <bufferGeometry>
+          <bufferAttribute attach="attributes-position" args={[outlinePositions, 3]} />
+        </bufferGeometry>
+        <lineBasicMaterial color={PROXIMITY_HATCH_COLOR} opacity={0.75} transparent />
+      </lineSegments>
     </group>
   );
 }
@@ -1354,10 +1495,39 @@ export default function IfcViewport({
             id: `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}`,
             source,
             target,
+            spanPoints: [...activeGroundFootprint.corners, ...footprint.corners],
             minY: Math.min(activeGroundFootprint.minY, footprint.minY),
             maxY: Math.max(activeGroundFootprint.maxY, footprint.maxY),
           };
         }
+      }
+
+      for (const target of getFootprintEdgeSegments(footprint.corners)) {
+        activeGroundFootprint.corners.forEach((corner, cornerIndex) => {
+          const projection = getPointLineProjection(corner, target);
+          if (!projection || projection.distance > EDGE_ALIGNMENT_TOLERANCE) return;
+
+          const source = buildProjectedPointSegment(corner, target);
+          if (!source) return;
+
+          const projectionGap = Math.max(
+            0,
+            -projection.projection,
+            projection.projection - projection.length,
+          );
+          const score = projection.distance + projectionGap * 0.001;
+          if (score >= bestScore) return;
+
+          bestScore = score;
+          bestHint = {
+            id: `${activeModelId}:${footprint.id}:corner-${cornerIndex}:${target.edge}`,
+            source,
+            target,
+            spanPoints: [...activeGroundFootprint.corners, ...footprint.corners],
+            minY: Math.min(activeGroundFootprint.minY, footprint.minY),
+            maxY: Math.max(activeGroundFootprint.maxY, footprint.maxY),
+          };
+        });
       }
     }
 
@@ -1674,6 +1844,7 @@ export default function IfcViewport({
               maxY={alignmentPlaneHint.maxY}
               minY={alignmentPlaneHint.minY}
               source={alignmentPlaneHint.source}
+              spanPoints={alignmentPlaneHint.spanPoints}
               target={alignmentPlaneHint.target}
             />
           </group>
