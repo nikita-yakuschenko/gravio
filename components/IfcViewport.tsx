@@ -1025,7 +1025,7 @@ function applyParallelEdgeRotationSnap(
   if (!entry) return placement;
   const { corners } = computeWorldFootprintFromObject(entry.object, entry.bounds, placement);
   const activeSegs = getFootprintEdgeSegments(corners);
-  let closest: { sa: GroundSegment; tb: GroundSegment; distSq: number } | null = null;
+  const candidates: Array<{ distSq: number; sa: GroundSegment; tb: GroundSegment }> = [];
 
   for (const s of sceneModelsList) {
     if (s.model.id === activeModelId) continue;
@@ -1034,22 +1034,23 @@ function applyParallelEdgeRotationSnap(
     for (const sa of activeSegs) {
       for (const tb of targetSegs) {
         const bridge = closestPointsOnSegments2D(sa.start, sa.end, tb.start, tb.end);
-        if (!closest || bridge.distanceSq < closest.distSq) {
-          closest = { sa, tb, distSq: bridge.distanceSq };
-        }
+        candidates.push({ distSq: bridge.distanceSq, sa, tb });
       }
     }
   }
-  if (!closest) return placement;
-  const { sa, tb } = closest;
-  const err = getParallelDelta(sa, tb);
-  if (err > ROTATE_PARALLEL_EDGE_MAGNET_RAD) return placement;
-  const angA = getSegmentAngle(sa);
-  const angT = getSegmentAngle(tb);
-  const adj = rotationShortestToParallelEdgeDirections(angA, angT);
-  const t = Math.max(0, 1 - err / ROTATE_PARALLEL_EDGE_MAGNET_RAD);
-  const applied = adj * t;
-  return { ...placement, rotationY: normalizeAngle(placement.rotationY + applied) };
+  candidates.sort((a, b) => a.distSq - b.distSq);
+  for (const { distSq, sa, tb } of candidates) {
+    if (distSq < 1e-12) continue;
+    const err = getParallelDelta(sa, tb);
+    if (err > ROTATE_PARALLEL_EDGE_MAGNET_RAD) continue;
+    const angA = getSegmentAngle(sa);
+    const angT = getSegmentAngle(tb);
+    const adj = rotationShortestToParallelEdgeDirections(angA, angT);
+    const t = Math.max(0, 1 - err / ROTATE_PARALLEL_EDGE_MAGNET_RAD);
+    const applied = adj * t;
+    return { ...placement, rotationY: normalizeAngle(placement.rotationY + applied) };
+  }
+  return placement;
 }
 
 function getParallelLineDistance(a: GroundSegment, b: GroundSegment): number {
@@ -1155,13 +1156,25 @@ function buildProximityHatchArea(
 
   const ux = dx / length;
   const uz = dz / length;
+
+  // Оба «bottom» в локали могут иметь противоположный обход → в мире направления разошлись на 180°.
+  // Без выравнивания перекрытие по одной оси и полоса между рёбрами считаются по-разному при swap source/target.
+  let t = target;
+  const tdx0 = t.end.x - t.start.x;
+  const tdz0 = t.end.z - t.start.z;
+  const tlen0 = Math.hypot(tdx0, tdz0);
+  if (tlen0 < 1e-9) return null;
+  if ((ux * tdx0 + uz * tdz0) / tlen0 < 0) {
+    t = { ...t, start: t.end, end: t.start };
+  }
+
   const project = (point: GroundPoint) =>
     (point.x - source.start.x) * ux + (point.z - source.start.z) * uz;
 
   const sourceStart = project(source.start);
   const sourceEnd = project(source.end);
-  const targetStart = project(target.start);
-  const targetEnd = project(target.end);
+  const targetStart = project(t.start);
+  const targetEnd = project(t.end);
   const sourceMin = Math.min(sourceStart, sourceEnd);
   const sourceMax = Math.max(sourceStart, sourceEnd);
   const targetMin = Math.min(targetStart, targetEnd);
@@ -1183,8 +1196,8 @@ function buildProximityHatchArea(
   const bridge = closestPointsOnSegments2D(
     source.start,
     source.end,
-    target.start,
-    target.end,
+    t.start,
+    t.end,
   );
   const bridgeLen = Math.sqrt(bridge.distanceSq);
   if (!Number.isFinite(bridgeLen) || bridgeLen < 1e-5 || bridgeLen > PROXIMITY_HATCH_DISTANCE) {
@@ -1201,16 +1214,17 @@ function buildProximityHatchArea(
   let normalZ = ux;
   const smx = (source.start.x + source.end.x) * 0.5;
   const smz = (source.start.z + source.end.z) * 0.5;
-  const tmx = (target.start.x + target.end.x) * 0.5;
-  const tmz = (target.start.z + target.end.z) * 0.5;
+  const tmx = (t.start.x + t.end.x) * 0.5;
+  const tmz = (t.start.z + t.end.z) * 0.5;
   if ((tmx - smx) * normalX + (tmz - smz) * normalZ < 0) {
     normalX = -normalX;
     normalZ = -normalZ;
   }
   const offsetAlongN =
-    (target.start.x - source.start.x) * normalX +
-    (target.start.z - source.start.z) * normalZ;
-  if (offsetAlongN <= 1e-6 || offsetAlongN > PROXIMITY_HATCH_DISTANCE) return null;
+    (t.start.x - source.start.x) * normalX +
+    (t.start.z - source.start.z) * normalZ;
+  const gapMag = Math.abs(offsetAlongN);
+  if (gapMag <= 1e-6 || gapMag > PROXIMITY_HATCH_DISTANCE) return null;
 
   const signedOffset = offsetAlongN;
 
@@ -1327,6 +1341,28 @@ function buildProximityHatchArea(
     bridgeA: { x: bridge.a.x, z: bridge.a.z },
     bridgeB: { x: bridge.b.x, z: bridge.b.z },
     gapDistance: bridgeLen,
+  };
+}
+
+/**
+ * Полоса строится вдоль первого аргумента; при разной длине параллельных рёбер перекрытие по
+ * проекции может для одной ориентации пройти проверки, для другой — нет → зона «пропадает»
+ * при смене активной модели. Пробуем обе ориентации, в API всегда source = ребро active, target = other.
+ */
+function buildProximityHatchAreaForPair(
+  activeEdge: GroundSegment,
+  otherEdge: GroundSegment,
+  id: string,
+): Omit<ProximityHatchArea, "sourceModelId" | "targetModelId"> | null {
+  const primary = buildProximityHatchArea(activeEdge, otherEdge, id);
+  if (primary) return primary;
+  const flipped = buildProximityHatchArea(otherEdge, activeEdge, id);
+  if (!flipped) return null;
+  return {
+    ...flipped,
+    id,
+    source: activeEdge,
+    target: otherEdge,
   };
 }
 
@@ -2919,50 +2955,47 @@ export default function IfcViewport({
         }
         candidates.sort((a, b) => a.distSq - b.distSq);
 
-        // Только ближайшая пара рёбер (минимальный зазор). Иначе при отказе ближайшей по параллели
-        // подсветка перескакивала на дальние «подходящие» рёбра — визуально неинформативно.
-        let closest: (typeof candidates)[0] | null = null;
-        for (const c of candidates) {
-          if (Math.sqrt(c.distSq) > 1e-6) {
-            closest = c;
-            break;
-          }
+        // Идём по возрастанию зазора. Первая же пара, для которой рёбра параллельны и строится полоса —
+        // это ближайшая «осмысленная» пара (параллельные грани). Сама по себе минимальная дистанция
+        // между отрезками часто даёт угол–ребро (не параллельно) — тогда без следующих кандидатов
+        // зона никогда не появится при визуально параллельных фасадах.
+        for (const { distSq, source, target } of candidates) {
+          const gap = Math.sqrt(distSq);
+          if (gap > PROXIMITY_HATCH_DISTANCE) break;
+          if (gap <= 1e-6) continue;
+          if (getParallelDelta(source, target) > PROXIMITY_HATCH_EDGE_TOLERANCE) continue;
+
+          const bridgePts = closestPointsOnSegments2D(
+            source.start,
+            source.end,
+            target.start,
+            target.end,
+          );
+          const gdx = bridgePts.b.x - bridgePts.a.x;
+          const gdz = bridgePts.b.z - bridgePts.a.z;
+          const sdx = source.end.x - source.start.x;
+          const sdz = source.end.z - source.start.z;
+          const slen = Math.hypot(sdx, sdz);
+          if (slen < 1e-9) continue;
+          const ux = sdx / slen;
+          const uz = sdz / slen;
+          const alongEdge = Math.abs(gdx * ux + gdz * uz);
+          if (alongEdge > 0.2 * gap + 1e-7) continue;
+
+          const area = buildProximityHatchAreaForPair(
+            source,
+            target,
+            `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}:hatch`,
+          );
+          if (!area) continue;
+          return {
+            ...area,
+            sourceModelId: activeModelId,
+            targetModelId: footprint.id,
+          };
         }
-        if (!closest) return null;
 
-        const { distSq, source, target } = closest;
-        const gap = Math.sqrt(distSq);
-        if (gap > PROXIMITY_HATCH_DISTANCE) return null;
-        if (getParallelDelta(source, target) > PROXIMITY_HATCH_EDGE_TOLERANCE) return null;
-
-        const bridgePts = closestPointsOnSegments2D(
-          source.start,
-          source.end,
-          target.start,
-          target.end,
-        );
-        const gdx = bridgePts.b.x - bridgePts.a.x;
-        const gdz = bridgePts.b.z - bridgePts.a.z;
-        const sdx = source.end.x - source.start.x;
-        const sdz = source.end.z - source.start.z;
-        const slen = Math.hypot(sdx, sdz);
-        if (slen < 1e-9) return null;
-        const ux = sdx / slen;
-        const uz = sdz / slen;
-        const alongEdge = Math.abs(gdx * ux + gdz * uz);
-        if (alongEdge > 0.2 * gap + 1e-7) return null;
-
-        const area = buildProximityHatchArea(
-          source,
-          target,
-          `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}:hatch`,
-        );
-        if (!area) return null;
-        return {
-          ...area,
-          sourceModelId: activeModelId,
-          targetModelId: footprint.id,
-        };
+        return null;
       })
       .filter((area): area is ProximityHatchArea => Boolean(area));
   }, [activeGroundFootprint, activeModelId, isTransforming, sceneGroundFootprints]);
@@ -3046,9 +3079,7 @@ export default function IfcViewport({
     if (!activeFootprint) return null;
 
     const activeEdges = getFootprintEdgeSegments(activeFootprint.corners);
-    let bestDistSq = Number.POSITIVE_INFINITY;
-    let bestA: GroundSegment | null = null;
-    let bestB: GroundSegment | null = null;
+    const candidates: Array<{ distSq: number; sa: GroundSegment; sb: GroundSegment }> = [];
 
     for (const other of sceneGroundFootprints) {
       if (other.id === activeModelId) continue;
@@ -3056,17 +3087,17 @@ export default function IfcViewport({
       for (const sa of activeEdges) {
         for (const sb of otherEdges) {
           const bridge = closestPointsOnSegments2D(sa.start, sa.end, sb.start, sb.end);
-          if (bridge.distanceSq >= bestDistSq) continue;
-          bestDistSq = bridge.distanceSq;
-          bestA = sa;
-          bestB = sb;
+          candidates.push({ distSq: bridge.distanceSq, sa, sb });
         }
       }
     }
-
-    if (!bestA || !bestB || !Number.isFinite(bestDistSq)) return null;
-    if (getParallelDelta(bestA, bestB) > ROTATE_PARALLEL_EDGE_HIGHLIGHT_RAD) return null;
-    return { segmentA: bestA, segmentB: bestB };
+    candidates.sort((a, b) => a.distSq - b.distSq);
+    for (const { distSq, sa, sb } of candidates) {
+      if (distSq < 1e-12) continue;
+      if (getParallelDelta(sa, sb) > ROTATE_PARALLEL_EDGE_HIGHLIGHT_RAD) continue;
+      return { segmentA: sa, segmentB: sb };
+    }
+    return null;
   }, [activeModelId, canvasGesture, isTransforming, sceneGroundFootprints]);
 
   const measurementLines = useMemo(() => {
