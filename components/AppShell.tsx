@@ -9,6 +9,7 @@ import type { IfcModelItem, IfcPlacement } from "@/types/ifc";
 const MODEL_DND_MIME = "application/x-gravio-model-id";
 type SidebarTab = "project" | "library";
 const ROTATION_SNAP_STEP_DEGREES = 15;
+const VIEWPORT_DEV_MODE_STORAGE_KEY = "gravio-viewport-dev-callouts";
 
 const IfcViewport = dynamic(() => import("@/components/IfcViewport"), {
   ssr: false,
@@ -53,6 +54,7 @@ export default function AppShell() {
   const [viewMode, setViewMode] = useState<"2d" | "3d">("3d");
   const [transformMode, setTransformMode] = useState<"translate" | "rotate">("translate");
   const [rotationSnapEnabled, setRotationSnapEnabled] = useState(true);
+  const [devMode, setDevMode] = useState(false);
 
   const {
     models,
@@ -78,6 +80,23 @@ export default function AppShell() {
   useEffect(() => {
     void hydrateFromStorage();
   }, [hydrateFromStorage]);
+
+  useEffect(() => {
+    try {
+      setDevMode(localStorage.getItem(VIEWPORT_DEV_MODE_STORAGE_KEY) === "1");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const setDevModePersisted = useCallback((value: boolean) => {
+    setDevMode(value);
+    try {
+      localStorage.setItem(VIEWPORT_DEV_MODE_STORAGE_KEY, value ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const activeModel = useMemo(
     () => models.find((model) => model.id === activeModelId) ?? null,
@@ -231,6 +250,33 @@ export default function AppShell() {
           >
             Snap {ROTATION_SNAP_STEP_DEGREES}°
           </button>
+          <div
+            className="flex items-center rounded border border-slate-700 bg-slate-800 p-0.5"
+            title="Янтарные контуры следов, выноски отладки"
+          >
+            <button
+              type="button"
+              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+                !devMode
+                  ? "bg-slate-600 text-slate-100"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+              onClick={() => setDevModePersisted(false)}
+            >
+              Off
+            </button>
+            <button
+              type="button"
+              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+                devMode
+                  ? "bg-amber-500/20 text-amber-200 ring-1 ring-amber-500/45"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+              onClick={() => setDevModePersisted(true)}
+            >
+              Dev mode
+            </button>
+          </div>
           {hydrationStatus === "loading" && <span>restoring...</span>}
           <span>{models.length} models</span>
           <span className="text-slate-600">|</span>
@@ -403,6 +449,7 @@ export default function AppShell() {
             activeModelId={activeModelId}
             viewMode={viewMode}
             transformMode={transformMode}
+            devMode={devMode}
             rotationSnapEnabled={rotationSnapEnabled}
             rotationSnapStepDegrees={ROTATION_SNAP_STEP_DEGREES}
             onGeometryLoading={handleGeometryLoading}

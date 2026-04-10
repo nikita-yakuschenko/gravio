@@ -1,8 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from "react";
-import { Canvas, type ThreeEvent, useThree } from "@react-three/fiber";
-import { Html, MapControls, OrbitControls } from "@react-three/drei";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type ReactNode,
+} from "react";
+import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
+import { Billboard, Html, MapControls, OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import type { IfcModelItem } from "@/types/ifc";
@@ -13,6 +21,8 @@ interface Props {
   activeModelId: string | null;
   viewMode: "2d" | "3d";
   transformMode: "translate" | "rotate";
+  /** Отладка: янтарные контуры следов, выноски HTML. */
+  devMode: boolean;
   rotationSnapEnabled: boolean;
   rotationSnapStepDegrees: number;
   onGeometryLoading: (id: string) => void;
@@ -82,6 +92,15 @@ interface ProximityHatchArea {
   id: string;
   corners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint];
   hatchSegments: Array<[GroundPoint, GroundPoint]>;
+  /** Рёбра следов, между которыми построена полоса (мир XZ). */
+  source: GroundSegment;
+  target: GroundSegment;
+  /** Ближайшие точки на отрезках source/target и зазор (как размерная линия). */
+  bridgeA: GroundPoint;
+  bridgeB: GroundPoint;
+  gapDistance: number;
+  sourceModelId: string;
+  targetModelId: string;
 }
 
 interface AlignmentSnapTarget {
@@ -128,11 +147,667 @@ const PARALLEL_EDGE_TOLERANCE = THREE.MathUtils.degToRad(0.75);
 const PROXIMITY_HATCH_EDGE_TOLERANCE = THREE.MathUtils.degToRad(3);
 const ALIGNMENT_SNAP_DISTANCE = 0.35;
 const EDGE_ALIGNMENT_TOLERANCE = 0.03;
+/** Зона по нормали к параллельным рёбрам: подтягиваем активную модель к общей грани (магнит). */
+const PARALLEL_FACE_MAGNET_DISTANCE = 0.14;
 const ALIGNMENT_PLANE_COLOR = "#ec4899";
 const PROXIMITY_HATCH_DISTANCE = 6;
 const PROXIMITY_HATCH_STEP = 0.35;
 const PROXIMITY_HATCH_COLOR = "#ec4899";
+const PROXIMITY_EDGE_HIGHLIGHT_Y = 0.12;
+const PROXIMITY_EDGE_HIGHLIGHT_COLOR = "#38bdf8";
+/** Допуск: угол зоны на границе следа (м). */
+const PROXIMITY_CORNER_ON_EDGE_EPS_M = 0.025;
+/** Временно: штриховка близости видна всегда (не только во время переноса/вращения). Поставьте false — вернётся старое поведение. */
+const PROXIMITY_HATCH_ALWAYS_ON = true;
 const SELECTION_ACCENT_COLOR = "#0173F7";
+/** Янтарный контур AABB по граням модели — для всех размещённых экземпляров (отладка / ориентир). */
+const ALL_MODELS_BOUNDS_OUTLINE_COLOR = "#f59e0b";
+/** Вбок в XZ перпендикулярно «объект→камера» (м) — крупное, чтобы панель не лезла на меш. */
+const DEBUG_CALLOUT_SIDE_OFFSET_METERS = 11;
+/** Дополнительно «наружу» от центра кластера моделей на земле (м). */
+const DEBUG_CALLOUT_RADIAL_PUSH_M = 12;
+/** Чуть к камере в XZ (м): выносит подпись в «передний план» относительно сцены. */
+const DEBUG_CALLOUT_TOWARD_CAMERA_M = 5;
+const DEBUG_CALLOUT_EXTRA_UP_METERS = 2.2;
+
+function fmt3(n: number) {
+  return Number.isFinite(n) ? n.toFixed(3) : "—";
+}
+
+function shortIdLabel(id: string) {
+  return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+
+function debugCalloutSideSign(id: string): number {
+  let s = 0;
+  for (let i = 0; i < id.length; i += 1) s += id.charCodeAt(i);
+  return s % 2 === 0 ? 1 : -1;
+}
+
+/** Ручной сдвиг выноски в пикселях экрана (внутри Html). */
+function DraggableCalloutChrome({
+  dragId,
+  pixelOffset,
+  onPixelDragDelta,
+  children,
+}: {
+  dragId: string;
+  pixelOffset: { x: number; y: number };
+  onPixelDragDelta: (id: string, dx: number, dy: number) => void;
+  children: React.ReactNode;
+}) {
+  const draggingRef = useRef(false);
+  return (
+    <div
+      style={{
+        transform: `translate(${pixelOffset.x}px, ${pixelOffset.y}px)`,
+        touchAction: "none",
+        pointerEvents: "auto",
+      }}
+    >
+      <div
+        className="mb-2 flex cursor-grab touch-none select-none items-center gap-2 rounded border border-slate-600/80 bg-slate-800/95 px-2 py-1 text-[11px] text-slate-300 active:cursor-grabbing"
+        onPointerDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          draggingRef.current = true;
+          try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+          } catch {
+            /* ignore */
+          }
+        }}
+        onPointerMove={(e) => {
+          if (!draggingRef.current) return;
+          onPixelDragDelta(dragId, e.movementX, e.movementY);
+        }}
+        onPointerUp={(e) => {
+          draggingRef.current = false;
+          try {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          } catch {
+            /* ignore */
+          }
+        }}
+        onPointerCancel={(e) => {
+          draggingRef.current = false;
+          try {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          } catch {
+            /* ignore */
+          }
+        }}
+      >
+        <span className="text-slate-500">⋮⋮</span>
+        Перетащить выноску
+      </div>
+      {children}
+    </div>
+  );
+}
+
+type DebugCalloutVariant = "model" | "proximity";
+
+const debugCalloutVariantStyle: Record<
+  DebugCalloutVariant,
+  { shell: string; heading: string; sep: string }
+> = {
+  model: {
+    shell: "border-amber-500/50",
+    heading: "text-amber-300",
+    sep: "border-amber-600/40",
+  },
+  proximity: {
+    shell: "border-fuchsia-500/55",
+    heading: "text-fuchsia-300",
+    sep: "border-fuchsia-700/45",
+  },
+};
+
+const CALLOUT_MONO = "font-mono text-[12px] leading-snug text-slate-100";
+const CALLOUT_HEADING = "text-[13px] font-bold tracking-tight";
+const CALLOUT_SECTION = "mt-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400";
+const CALLOUT_LINE = "text-[12px] text-slate-200";
+const CALLOUT_MUTED = "text-[11px] text-slate-500";
+const CALLOUT_BTN =
+  "rounded border border-slate-600/80 bg-slate-800/90 px-2 py-0.5 text-[11px] text-slate-200 hover:bg-slate-700";
+
+function DebugCalloutPanel({
+  variant,
+  heading,
+  brief,
+  detail,
+  copyText,
+}: {
+  variant: DebugCalloutVariant;
+  heading: ReactNode;
+  brief: ReactNode;
+  detail: ReactNode;
+  copyText: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const vs = debugCalloutVariantStyle[variant];
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(copyText);
+    } catch {
+      /* ignore */
+    }
+  }, [copyText]);
+  return (
+    <div
+      className={`max-w-[min(520px,92vw)] rounded-md border-2 ${vs.shell} bg-slate-950/94 px-3 py-2.5 shadow-2xl backdrop-blur-sm ${CALLOUT_MONO}`}
+    >
+      <div className={`flex flex-wrap items-start justify-between gap-2 border-b ${vs.sep} pb-2`}>
+        <div className={`min-w-0 flex-1 ${CALLOUT_HEADING} ${vs.heading}`}>{heading}</div>
+        <div className="flex shrink-0 flex-col items-stretch gap-1 sm:flex-row sm:items-center">
+          <button type="button" className={CALLOUT_BTN} onClick={() => void handleCopy()}>
+            Копировать
+          </button>
+          <button type="button" className={CALLOUT_BTN} onClick={() => setExpanded((x) => !x)}>
+            {expanded ? "Свернуть" : "Полностью"}
+          </button>
+        </div>
+      </div>
+      <div className="mt-2">{brief}</div>
+      {expanded ? <div className={`mt-3 border-t ${vs.sep} pt-2`}>{detail}</div> : null}
+    </div>
+  );
+}
+
+/** Якорь: наружа от центра сцены + вбок от вида + легкий сдвиг к камере — подпись не на моделях. */
+function DebugCalloutAnchor({
+  base,
+  sideSign,
+  radialOrigin,
+  children,
+}: {
+  base: [number, number, number];
+  sideSign: number;
+  /** Центр кластера моделей (XZ); от него толкаем подпись «наружу». */
+  radialOrigin: { x: number; z: number } | null;
+  children: React.ReactNode;
+}) {
+  const groupRef = useRef<THREE.Group>(null);
+  const baseRef = useRef(base);
+  baseRef.current = base;
+  const radialRef = useRef(radialOrigin);
+  radialRef.current = radialOrigin;
+  const { camera } = useThree();
+  useFrame(() => {
+    const g = groupRef.current;
+    if (!g) return;
+    let bx = baseRef.current[0];
+    let by = baseRef.current[1];
+    let bz = baseRef.current[2];
+
+    const ro = radialRef.current;
+    if (ro) {
+      let rx = bx - ro.x;
+      let rz = bz - ro.z;
+      let rlen = Math.hypot(rx, rz);
+      if (rlen < 0.35) {
+        rx = camera.position.x - bx;
+        rz = camera.position.z - bz;
+        rlen = Math.hypot(rx, rz);
+        if (rlen < 1e-8) {
+          rx = 1;
+          rz = 0;
+          rlen = 1;
+        }
+      }
+      rx /= rlen;
+      rz /= rlen;
+      bx += rx * DEBUG_CALLOUT_RADIAL_PUSH_M;
+      bz += rz * DEBUG_CALLOUT_RADIAL_PUSH_M;
+    }
+
+    let vx = camera.position.x - bx;
+    let vz = camera.position.z - bz;
+    let flat = Math.hypot(vx, vz);
+    if (flat < 1e-8) {
+      vx = 1;
+      vz = 0;
+      flat = 1;
+    } else {
+      vx /= flat;
+      vz /= flat;
+    }
+    if (DEBUG_CALLOUT_TOWARD_CAMERA_M > 0) {
+      bx += vx * DEBUG_CALLOUT_TOWARD_CAMERA_M;
+      bz += vz * DEBUG_CALLOUT_TOWARD_CAMERA_M;
+    }
+    const px = -vz * DEBUG_CALLOUT_SIDE_OFFSET_METERS * sideSign;
+    const pz = vx * DEBUG_CALLOUT_SIDE_OFFSET_METERS * sideSign;
+    g.position.set(bx + px, by + DEBUG_CALLOUT_EXTRA_UP_METERS, bz + pz);
+  });
+  return <group ref={groupRef}>{children}</group>;
+}
+
+function ModelDebugCallout({
+  model,
+  bounds,
+  object,
+  placement,
+  radialOrigin,
+  pixelOffset,
+  onPixelDragDelta,
+}: {
+  model: IfcModelItem;
+  bounds: ModelBounds;
+  object: THREE.Object3D;
+  placement: IfcModelItem["placement"];
+  radialOrigin: { x: number; z: number } | null;
+  pixelOffset: { x: number; y: number };
+  onPixelDragDelta: (id: string, dx: number, dy: number) => void;
+}) {
+  const ox = object.position.x;
+  const oy = object.position.y;
+  const oz = object.position.z;
+  const cx = ox + (bounds.minX + bounds.maxX) * 0.5;
+  const cy = oy + bounds.maxY + 0.35;
+  const cz = oz + (bounds.minZ + bounds.maxZ) * 0.5;
+  const stats = model.geometryStats;
+  const rotDeg = THREE.MathUtils.radToDeg(placement.rotationY);
+
+  const copyText = useMemo(() => {
+    const lines: string[] = [
+      "Тип: IFC-модель",
+      `ID: ${model.id}`,
+      "",
+      "САЙТ (placement)",
+      `pos: ${fmt3(placement.x)}, ${fmt3(placement.y)}, ${fmt3(placement.z)}`,
+      `rotY: ${fmt3(rotDeg)}°`,
+      "",
+      "IFC (center-ground)",
+    ];
+    if (stats) {
+      lines.push(
+        `offset: ${fmt3(stats.placement.offset.x)}, ${fmt3(stats.placement.offset.y)}, ${fmt3(stats.placement.offset.z)}`,
+      );
+      lines.push(
+        `src min Y: ${fmt3(stats.placement.sourceBounds.min.y)} … max: ${fmt3(stats.placement.sourceBounds.max.y)}`,
+      );
+    } else {
+      lines.push("stats: —");
+    }
+    lines.push(`group.pos: ${fmt3(ox)}, ${fmt3(oy)}, ${fmt3(oz)}`);
+    lines.push("");
+    lines.push("AABB (лок. корня IFC)");
+    lines.push(`minY…maxY: ${fmt3(bounds.minY)} … ${fmt3(bounds.maxY)}`);
+    lines.push(
+      `XZ: [${fmt3(bounds.minX)}, ${fmt3(bounds.minZ)}] — [${fmt3(bounds.maxX)}, ${fmt3(bounds.maxZ)}]`,
+    );
+    if (stats) {
+      lines.push("");
+      lines.push(
+        `ГЕОМ: ${stats.meshes} m · ${stats.vertices} v · ${stats.triangles} tri · ${fmt3(stats.buildMs)} ms`,
+      );
+    }
+    return lines.join("\n");
+  }, [bounds, model.id, ox, oy, oz, placement, rotDeg, stats]);
+
+  const brief = (
+    <div className="space-y-1">
+      <div className={CALLOUT_LINE}>
+        pos: {fmt3(placement.x)}, {fmt3(placement.y)}, {fmt3(placement.z)} · rotY {fmt3(rotDeg)}°
+      </div>
+      <div className={CALLOUT_MUTED}>
+        AABB Y: {fmt3(bounds.minY)} … {fmt3(bounds.maxY)} · XZ [{fmt3(bounds.minX)}, {fmt3(bounds.minZ)}] — [
+        {fmt3(bounds.maxX)}, {fmt3(bounds.maxZ)}]
+      </div>
+    </div>
+  );
+
+  const detail = (
+    <div>
+      <div className={CALLOUT_SECTION}>САЙТ (placement)</div>
+      <div className={CALLOUT_LINE}>
+        pos: {fmt3(placement.x)}, {fmt3(placement.y)}, {fmt3(placement.z)}
+      </div>
+      <div className={CALLOUT_LINE}>rotY: {fmt3(rotDeg)}°</div>
+      <div className={CALLOUT_SECTION}>IFC (center-ground)</div>
+      {stats ? (
+        <>
+          <div className={CALLOUT_LINE}>
+            offset: {fmt3(stats.placement.offset.x)}, {fmt3(stats.placement.offset.y)},{" "}
+            {fmt3(stats.placement.offset.z)}
+          </div>
+          <div className={CALLOUT_MUTED}>
+            src min: {fmt3(stats.placement.sourceBounds.min.y)} … max:{" "}
+            {fmt3(stats.placement.sourceBounds.max.y)} (Y)
+          </div>
+        </>
+      ) : (
+        <div className={CALLOUT_MUTED}>stats: —</div>
+      )}
+      <div className={CALLOUT_LINE}>
+        group.pos: {fmt3(ox)}, {fmt3(oy)}, {fmt3(oz)}
+      </div>
+      <div className={CALLOUT_SECTION}>AABB (лок. корня IFC)</div>
+      <div className={CALLOUT_LINE}>
+        minY…maxY: {fmt3(bounds.minY)} … {fmt3(bounds.maxY)}
+      </div>
+      <div className={CALLOUT_LINE}>
+        XZ: [{fmt3(bounds.minX)}, {fmt3(bounds.minZ)}] — [{fmt3(bounds.maxX)}, {fmt3(bounds.maxZ)}]
+      </div>
+      {stats ? (
+        <div className={`${CALLOUT_SECTION} mt-2`}>
+          ГЕОМ: {stats.meshes} m · {stats.vertices} v · {stats.triangles} tri · {fmt3(stats.buildMs)} ms
+        </div>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <DebugCalloutAnchor
+      base={[cx, cy, cz]}
+      sideSign={debugCalloutSideSign(model.id)}
+      radialOrigin={radialOrigin}
+    >
+      <Billboard follow>
+        <Html
+          center
+          occlude={false}
+          style={{ pointerEvents: "auto", userSelect: "none", width: "max-content" }}
+        >
+          <DraggableCalloutChrome
+            dragId={model.id}
+            pixelOffset={pixelOffset}
+            onPixelDragDelta={onPixelDragDelta}
+          >
+            <DebugCalloutPanel
+              variant="model"
+              heading={shortIdLabel(model.id)}
+              brief={brief}
+              detail={detail}
+              copyText={copyText}
+            />
+          </DraggableCalloutChrome>
+        </Html>
+      </Billboard>
+    </DebugCalloutAnchor>
+  );
+}
+
+function ProximityHatchDebugLabel({
+  area,
+  footprints,
+  radialOrigin,
+  pixelOffset,
+  onPixelDragDelta,
+  onHoverCornerSegment,
+}: {
+  area: ProximityHatchArea;
+  footprints: ModelGroundFootprint[];
+  radialOrigin: { x: number; z: number } | null;
+  pixelOffset: { x: number; y: number };
+  onPixelDragDelta: (id: string, dx: number, dy: number) => void;
+  /** A,B → ребро source; C,D → target; подсветка на сцене. */
+  onHoverCornerSegment: (corner: "A" | "B" | "C" | "D" | null) => void;
+}) {
+  const labelPos = useMemo((): [number, number, number] => {
+    const [a, b, c, d] = area.corners;
+    const x = (a.x + b.x + c.x + d.x) * 0.25;
+    const z = (a.z + b.z + c.z + d.z) * 0.25;
+    return [x, 0.2, z];
+  }, [area.corners]);
+
+  const parsed = useMemo(() => {
+    const p = area.id.split(":");
+    if (p.length >= 5 && p[4] === "hatch") {
+      return { active: p[0], other: p[1], srcEdge: p[2], tgtEdge: p[3] };
+    }
+    return null;
+  }, [area.id]);
+
+  const fpActive = useMemo(() => {
+    if (!parsed) return undefined;
+    return footprints.find((f) => f.id === parsed.active);
+  }, [footprints, parsed]);
+
+  const fpOther = useMemo(() => {
+    if (!parsed) return undefined;
+    return footprints.find((f) => f.id === parsed.other);
+  }, [footprints, parsed]);
+
+  const cornerChecks = useMemo(() => {
+    const labels = ["A", "B", "C", "D"] as const;
+    return area.corners.map((p, i) => {
+      const onChosenEdge = i < 2 ? area.source : area.target;
+      const role = i < 2 ? ("source" as const) : ("target" as const);
+      const chk = groundPointOnSegment(p, onChosenEdge);
+      const minA = fpActive ? minDistanceToFootprintEdges(p, fpActive.corners) : null;
+      const minO = fpOther ? minDistanceToFootprintEdges(p, fpOther.corners) : null;
+      return { name: labels[i], p, role, edge: onChosenEdge.edge, chk, minA, minO };
+    });
+  }, [area.corners, area.source, area.target, fpActive, fpOther]);
+
+  const spans = useMemo(() => {
+    const [a, b, c, d] = area.corners;
+    return [
+      Math.hypot(b.x - a.x, b.z - a.z),
+      Math.hypot(c.x - b.x, c.z - b.z),
+      Math.hypot(d.x - c.x, d.z - c.z),
+      Math.hypot(a.x - d.x, a.z - d.z),
+    ];
+  }, [area.corners]);
+
+  const copyText = useMemo(() => {
+    const lines: string[] = [
+      "Тип: зона близости",
+      `ID: ${area.id}`,
+      "",
+      `Зазор (мост): ${fmt3(area.gapDistance)} м`,
+    ];
+    if (parsed) {
+      lines.push(`${shortIdLabel(parsed.active)} → ${shortIdLabel(parsed.other)}`);
+      lines.push(`рёбра: ${parsed.srcEdge} / ${parsed.tgtEdge}`);
+    }
+    lines.push(`стороны: ${spans.map((s) => fmt3(s)).join(" · ")} м`);
+    lines.push(
+      `центр якоря: ${fmt3(labelPos[0])}, ${fmt3(labelPos[1])}, ${fmt3(labelPos[2])}`,
+    );
+    lines.push("");
+    lines.push("Углы (мир, X Z) и отрезок границы");
+    lines.push(`Допуск «на отрезке»: ${fmt3(PROXIMITY_CORNER_ON_EDGE_EPS_M)} м`);
+    for (const row of cornerChecks) {
+      const seg =
+        row.chk.len > 1e-6
+          ? `d⊥=${fmt3(row.chk.perp)} т=${fmt3(row.chk.along)}/${fmt3(row.chk.len)}`
+          : `d⊥=${fmt3(row.chk.perp)}`;
+      lines.push(
+        `${row.name} (${fmt3(row.p.x)}, ${fmt3(row.p.z)}) ребро ${row.role} [${row.edge}]: ${row.chk.on ? "на отрезке" : "вне"} ${seg}`,
+      );
+      lines.push(
+        `  min до контура active: ${row.minA !== null ? fmt3(row.minA) : "—"} · other: ${row.minO !== null ? fmt3(row.minO) : "—"}`,
+      );
+    }
+    return lines.join("\n");
+  }, [area.gapDistance, area.id, cornerChecks, labelPos, parsed, spans]);
+
+  const brief = (
+    <div className="space-y-1">
+      <div className={`${CALLOUT_LINE} break-all`} title={area.id}>
+        {parsed ? (
+          <>
+            {shortIdLabel(parsed.active)} → {shortIdLabel(parsed.other)}
+            <span className={CALLOUT_MUTED}>
+              {" "}
+              · рёбра {parsed.srcEdge}/{parsed.tgtEdge}
+            </span>
+          </>
+        ) : (
+          <span className={CALLOUT_MUTED}>id без разбора</span>
+        )}
+      </div>
+      <div className={CALLOUT_LINE}>зазор: {fmt3(area.gapDistance)} м</div>
+      <div className={CALLOUT_MUTED}>стороны: {spans.map((s) => fmt3(s)).join(" · ")} м</div>
+    </div>
+  );
+
+  const detail = (
+    <div
+      onPointerLeave={(e) => {
+        const next = e.relatedTarget as Node | null;
+        if (!next || !e.currentTarget.contains(next)) {
+          onHoverCornerSegment(null);
+        }
+      }}
+    >
+      <div className={CALLOUT_SECTION}>Идентификатор</div>
+      <div className={`${CALLOUT_LINE} break-all`}>{area.id}</div>
+      {parsed ? (
+        <div className="mt-2 space-y-1">
+          <div className={CALLOUT_LINE}>
+            {shortIdLabel(parsed.active)} → {shortIdLabel(parsed.other)}
+          </div>
+          <div className={CALLOUT_MUTED}>
+            рёбра: {parsed.srcEdge} / {parsed.tgtEdge}
+          </div>
+        </div>
+      ) : null}
+      <div className={`${CALLOUT_SECTION} mt-2`}>Углы (мир, X Z) и отрезок границы</div>
+      {cornerChecks.map((row) => (
+        <div
+          key={row.name}
+          className="mb-1 cursor-default rounded border border-transparent px-0.5 pb-1 last:mb-0 hover:border-fuchsia-500/35 hover:bg-slate-800/50"
+          onPointerEnter={() => onHoverCornerSegment(row.name)}
+        >
+          <span className="font-bold text-cyan-200">{row.name}</span>{" "}
+          <span className={CALLOUT_MUTED}>
+            ({fmt3(row.p.x)}, {fmt3(row.p.z)})
+          </span>
+          <div className={`pl-2 ${CALLOUT_MUTED}`}>
+            ребро {row.role} [{row.edge}]:{" "}
+            <span className={row.chk.on ? "text-emerald-400" : "text-rose-400"}>
+              {row.chk.on ? "на отрезке ✓" : "вне ✗"}
+            </span>
+            {row.chk.len > 1e-6 ? (
+              <span className={CALLOUT_MUTED}>
+                {" "}
+                d⊥={fmt3(row.chk.perp)} т={fmt3(row.chk.along)}/{fmt3(row.chk.len)}
+              </span>
+            ) : (
+              <span className={CALLOUT_MUTED}> d⊥={fmt3(row.chk.perp)}</span>
+            )}
+          </div>
+          <div className={`pl-2 ${CALLOUT_MUTED}`}>
+            min до контура active: {row.minA !== null ? fmt3(row.minA) : "—"} · other:{" "}
+            {row.minO !== null ? fmt3(row.minO) : "—"}
+          </div>
+        </div>
+      ))}
+      <div className={`${CALLOUT_MUTED} mt-1`}>
+        Допуск «на отрезке»: {fmt3(PROXIMITY_CORNER_ON_EDGE_EPS_M)} м (перп. и по длине).
+      </div>
+      <div className={`${CALLOUT_SECTION} mt-2`}>Якорь и габариты</div>
+      <div className={CALLOUT_MUTED}>
+        центр якоря: {fmt3(labelPos[0])}, {fmt3(labelPos[1])}, {fmt3(labelPos[2])}
+      </div>
+      <div className={CALLOUT_MUTED}>стороны: {spans.map((s) => fmt3(s)).join(" · ")} м</div>
+    </div>
+  );
+
+  return (
+    <DebugCalloutAnchor
+      base={labelPos}
+      sideSign={debugCalloutSideSign(area.id)}
+      radialOrigin={radialOrigin}
+    >
+      <Billboard follow>
+        <Html
+          center
+          occlude={false}
+          style={{ pointerEvents: "auto", userSelect: "none", width: "max-content" }}
+        >
+          <DraggableCalloutChrome
+            dragId={area.id}
+            pixelOffset={pixelOffset}
+            onPixelDragDelta={onPixelDragDelta}
+          >
+            <DebugCalloutPanel
+              variant="proximity"
+              heading="Зона близости"
+              brief={brief}
+              detail={detail}
+              copyText={copyText}
+            />
+          </DraggableCalloutChrome>
+        </Html>
+      </Billboard>
+    </DebugCalloutAnchor>
+  );
+}
+
+function modelBoundsOutlinePositions(bounds: ModelBounds): Float32Array {
+  const { minX, maxX, minZ, maxZ, minY } = bounds;
+  const y = minY;
+  return new Float32Array([
+    minX,
+    y,
+    minZ,
+    maxX,
+    y,
+    minZ,
+    maxX,
+    y,
+    minZ,
+    maxX,
+    y,
+    maxZ,
+    maxX,
+    y,
+    maxZ,
+    minX,
+    y,
+    maxZ,
+    minX,
+    y,
+    maxZ,
+    minX,
+    y,
+    minZ,
+  ]);
+}
+
+/** Контур по bounds; raycast отключён, чтобы не перехватывать перенос/вращение (THREE.Line, не SVG `<line>`). */
+function NonPickableFootprintOutline({
+  bounds,
+  color,
+  depthTest = true,
+}: {
+  bounds: ModelBounds;
+  color: string;
+  depthTest?: boolean;
+}) {
+  const lineObject = useMemo(() => {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new THREE.BufferAttribute(modelBoundsOutlinePositions(bounds), 3),
+    );
+    const material = new THREE.LineBasicMaterial({ color, depthTest });
+    const line = new THREE.Line(geometry, material);
+    line.raycast = () => {};
+    return line;
+  }, [bounds, color, depthTest]);
+
+  useEffect(
+    () => () => {
+      lineObject.geometry.dispose();
+      const mat = lineObject.material;
+      if (Array.isArray(mat)) {
+        for (const m of mat) m.dispose();
+      } else {
+        mat.dispose();
+      }
+    },
+    [lineObject],
+  );
+
+  return <primitive object={lineObject} />;
+}
 
 function normalizeAngle(angle: number): number {
   let value = angle;
@@ -150,40 +825,8 @@ function getGroundPointFromEvent(event: ThreeEvent<PointerEvent>): THREE.Vector3
 function updateSelectionBounds(object: THREE.Group): ModelBounds {
   object.updateWorldMatrix(true, true);
 
-  const parentInverse = new THREE.Matrix4();
-  if (object.parent) {
-    parentInverse.copy(object.parent.matrixWorld).invert();
-  } else {
-    parentInverse.identity();
-  }
-
-  const bounds = new THREE.Box3();
-  const elementBox = new THREE.Box3();
-  const elementMatrix = new THREE.Matrix4();
-  let hasGeometry = false;
-
-  object.traverse((node) => {
-    const mesh = node as THREE.Mesh;
-    if (!mesh.isMesh) return;
-
-    const geometry = mesh.geometry;
-    if (!geometry) return;
-    if (!geometry.boundingBox) geometry.computeBoundingBox();
-    if (!geometry.boundingBox) return;
-
-    elementBox.copy(geometry.boundingBox);
-    elementMatrix.multiplyMatrices(parentInverse, mesh.matrixWorld);
-    elementBox.applyMatrix4(elementMatrix);
-
-    if (!hasGeometry) {
-      bounds.copy(elementBox);
-      hasGeometry = true;
-    } else {
-      bounds.union(elementBox);
-    }
-  });
-
-  if (!hasGeometry || bounds.isEmpty()) {
+  const worldBox = new THREE.Box3().setFromObject(object, true);
+  if (worldBox.isEmpty()) {
     return {
       minX: -1,
       maxX: 1,
@@ -193,26 +836,91 @@ function updateSelectionBounds(object: THREE.Group): ModelBounds {
       maxZ: 1,
     };
   }
+
+  const invRoot = new THREE.Matrix4().copy(object.matrixWorld).invert();
+  const corner = new THREE.Vector3();
+  const localBox = new THREE.Box3();
+  const corners: Array<[number, number, number]> = [
+    [worldBox.min.x, worldBox.min.y, worldBox.min.z],
+    [worldBox.min.x, worldBox.min.y, worldBox.max.z],
+    [worldBox.min.x, worldBox.max.y, worldBox.min.z],
+    [worldBox.min.x, worldBox.max.y, worldBox.max.z],
+    [worldBox.max.x, worldBox.min.y, worldBox.min.z],
+    [worldBox.max.x, worldBox.min.y, worldBox.max.z],
+    [worldBox.max.x, worldBox.max.y, worldBox.min.z],
+    [worldBox.max.x, worldBox.max.y, worldBox.max.z],
+  ];
+  for (const [x, y, z] of corners) {
+    corner.set(x, y, z).applyMatrix4(invRoot);
+    localBox.expandByPoint(corner);
+  }
+
   return {
-    minX: bounds.min.x,
-    maxX: bounds.max.x,
-    minY: bounds.min.y,
-    maxY: bounds.max.y,
-    minZ: bounds.min.z,
-    maxZ: bounds.max.z,
+    minX: localBox.min.x,
+    maxX: localBox.max.x,
+    minY: localBox.min.y,
+    maxY: localBox.max.y,
+    minZ: localBox.min.z,
+    maxZ: localBox.max.z,
   };
 }
 
-function transformLocalGroundPoint(
-  point: GroundPoint,
+/** Матрицы для расчёта следа без лишних аллокаций (синхронно в useMemo). */
+const _footprintWorld = {
+  placement: new THREE.Matrix4(),
+  world: new THREE.Matrix4(),
+  v: new THREE.Vector3(),
+  q: new THREE.Quaternion(),
+  pos: new THREE.Vector3(),
+  scale: new THREE.Vector3(1, 1, 1),
+  yAxis: new THREE.Vector3(0, 1, 0),
+};
+
+/**
+ * След на земле в мировых XZ: как у `<group placement> * <primitive object />` с контуром по bounds —
+ * placement * object.matrix * (угол bounds на «полу»), без ручного bounds+position и без потери rotation/scale.
+ */
+function computeWorldFootprintFromObject(
+  object: THREE.Group,
+  bounds: ModelBounds,
   placement: IfcModelItem["placement"],
-): GroundPoint {
-  const cos = Math.cos(placement.rotationY);
-  const sin = Math.sin(placement.rotationY);
-  return {
-    x: placement.x + point.x * cos - point.z * sin,
-    z: placement.z + point.x * sin + point.z * cos,
-  };
+): {
+  corners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint];
+  minY: number;
+  maxY: number;
+} {
+  object.updateMatrix();
+  _footprintWorld.q.setFromAxisAngle(_footprintWorld.yAxis, placement.rotationY);
+  _footprintWorld.pos.set(placement.x, placement.y, placement.z);
+  _footprintWorld.placement.compose(_footprintWorld.pos, _footprintWorld.q, _footprintWorld.scale);
+  _footprintWorld.world.multiplyMatrices(_footprintWorld.placement, object.matrix);
+
+  const { minX, maxX, minY, maxY, minZ, maxZ } = bounds;
+  const yFloor = minY;
+  const xz: Array<[number, number]> = [
+    [minX, minZ],
+    [maxX, minZ],
+    [maxX, maxZ],
+    [minX, maxZ],
+  ];
+  const corners = xz.map(([x, z]) => {
+    _footprintWorld.v.set(x, yFloor, z).applyMatrix4(_footprintWorld.world);
+    return { x: _footprintWorld.v.x, z: _footprintWorld.v.z };
+  }) as [GroundPoint, GroundPoint, GroundPoint, GroundPoint];
+
+  let wMinY = Number.POSITIVE_INFINITY;
+  let wMaxY = Number.NEGATIVE_INFINITY;
+  for (const x of [minX, maxX] as const) {
+    for (const y of [minY, maxY] as const) {
+      for (const z of [minZ, maxZ] as const) {
+        _footprintWorld.v.set(x, y, z).applyMatrix4(_footprintWorld.world);
+        wMinY = Math.min(wMinY, _footprintWorld.v.y);
+        wMaxY = Math.max(wMaxY, _footprintWorld.v.y);
+      }
+    }
+  }
+
+  return { corners, minY: wMinY, maxY: wMaxY };
 }
 
 function getFootprintSegments(
@@ -252,6 +960,50 @@ function getParallelLineDistance(a: GroundSegment, b: GroundSegment): number {
   const length = Math.hypot(dx, dz);
   if (length < 1e-6) return Number.POSITIVE_INFINITY;
   return Math.abs((b.start.x - a.start.x) * dz - (b.start.z - a.start.z) * dx) / length;
+}
+
+/**
+ * Сдвиг центра модели (XZ), устраняющий зазор между параллельными прямыми ребёр
+ * (перенос всего следа на вектор, зануляющий 2D cross для target.start относительно прямой source).
+ */
+function parallelFacePlacementCorrection(source: GroundSegment, target: GroundSegment): {
+  dx: number;
+  dz: number;
+} | null {
+  const ddx = source.end.x - source.start.x;
+  const ddz = source.end.z - source.start.z;
+  const L2 = ddx * ddx + ddz * ddz;
+  if (L2 < 1e-12) return null;
+  const cross = (target.start.x - source.start.x) * ddz - (target.start.z - source.start.z) * ddx;
+  const k = cross / L2;
+  return { dx: k * ddz, dz: -k * ddx };
+}
+
+/** Лучшая пара параллельных рёбер в зоне магнита → сдвиг placement. */
+function computeParallelFaceMagnetDelta(
+  activeCorners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint],
+  otherFootprints: ModelGroundFootprint[],
+): { dx: number; dz: number } | null {
+  const activeEdges = getFootprintEdgeSegments(activeCorners);
+  let bestDist = Number.POSITIVE_INFINITY;
+  let bestPair: { source: GroundSegment; target: GroundSegment } | null = null;
+
+  for (const fp of otherFootprints) {
+    const targetEdges = getFootprintEdgeSegments(fp.corners);
+    for (const source of activeEdges) {
+      for (const target of targetEdges) {
+        if (getParallelDelta(source, target) > PARALLEL_EDGE_TOLERANCE) continue;
+        const dist = getParallelLineDistance(source, target);
+        if (!Number.isFinite(dist) || dist >= PARALLEL_FACE_MAGNET_DISTANCE) continue;
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPair = { source, target };
+        }
+      }
+    }
+  }
+  if (!bestPair) return null;
+  return parallelFacePlacementCorrection(bestPair.source, bestPair.target);
 }
 
 function getPointLineProjection(point: GroundPoint, line: GroundSegment) {
@@ -297,7 +1049,7 @@ function buildProximityHatchArea(
   source: GroundSegment,
   target: GroundSegment,
   id: string,
-): ProximityHatchArea | null {
+): Omit<ProximityHatchArea, "sourceModelId" | "targetModelId"> | null {
   const dx = source.end.x - source.start.x;
   const dz = source.end.z - source.start.z;
   const length = Math.hypot(dx, dz);
@@ -305,8 +1057,6 @@ function buildProximityHatchArea(
 
   const ux = dx / length;
   const uz = dz / length;
-  const normalX = -uz;
-  const normalZ = ux;
   const project = (point: GroundPoint) =>
     (point.x - source.start.x) * ux + (point.z - source.start.z) * uz;
 
@@ -326,18 +1076,45 @@ function buildProximityHatchArea(
     sourceMax,
     targetMax,
   );
-  if (overlapEnd - overlapStart < 0.2) return null;
+  // Только вырожденный случай: нет общего отрезка по направлению ребра (не отсекаем узкие коридоры).
+  if (overlapEnd - overlapStart < 1e-5) return null;
 
-  const sourceSpan = sourceMax - sourceMin;
-  const targetSpan = targetMax - targetMin;
-  const hatchStart = sourceSpan >= targetSpan ? sourceMin : targetMin;
-  const hatchEnd = sourceSpan >= targetSpan ? sourceMax : targetMax;
+  const hatchStart = overlapStart;
+  const hatchEnd = overlapEnd;
 
-  const signedOffset =
+  const bridge = closestPointsOnSegments2D(
+    source.start,
+    source.end,
+    target.start,
+    target.end,
+  );
+  const bridgeLen = Math.sqrt(bridge.distanceSq);
+  if (!Number.isFinite(bridgeLen) || bridgeLen < 1e-5 || bridgeLen > PROXIMITY_HATCH_DISTANCE) {
+    return null;
+  }
+  const gdx = bridge.b.x - bridge.a.x;
+  const gdz = bridge.b.z - bridge.a.z;
+  const alongEdge = Math.abs(gdx * ux + gdz * uz);
+  // Без жёсткой добавки 1e-4 — при микрозазоре она ломала почти параллельные пары.
+  if (alongEdge > 0.2 * bridgeLen + 1e-7) return null;
+
+  // Перпендикуляр к ребру в XZ и точное расстояние между параллельными прямыми (без нормализации моста — иначе зазор «плывёт»).
+  let normalX = -uz;
+  let normalZ = ux;
+  const smx = (source.start.x + source.end.x) * 0.5;
+  const smz = (source.start.z + source.end.z) * 0.5;
+  const tmx = (target.start.x + target.end.x) * 0.5;
+  const tmz = (target.start.z + target.end.z) * 0.5;
+  if ((tmx - smx) * normalX + (tmz - smz) * normalZ < 0) {
+    normalX = -normalX;
+    normalZ = -normalZ;
+  }
+  const offsetAlongN =
     (target.start.x - source.start.x) * normalX +
     (target.start.z - source.start.z) * normalZ;
-  const gapDistance = Math.abs(signedOffset);
-  if (gapDistance < 0.01 || gapDistance > PROXIMITY_HATCH_DISTANCE) return null;
+  if (offsetAlongN <= 1e-6 || offsetAlongN > PROXIMITY_HATCH_DISTANCE) return null;
+
+  const signedOffset = offsetAlongN;
 
   const pointOnSource = (value: number): GroundPoint => ({
     x: source.start.x + ux * value,
@@ -424,14 +1201,79 @@ function buildProximityHatchArea(
       }
     }
 
-    if (bestDistance < 0.05) continue;
+    if (bestDistance < 0.008) continue;
     hatchSegments.push([
       localToWorld(start.projection, start.offset),
       localToWorld(end.projection, end.offset),
     ]);
   }
 
-  return { id, corners: [a, b, c, d], hatchSegments };
+  return {
+    id,
+    corners: [a, b, c, d],
+    hatchSegments,
+    source,
+    target,
+    bridgeA: { x: bridge.a.x, z: bridge.a.z },
+    bridgeB: { x: bridge.b.x, z: bridge.b.z },
+    gapDistance: bridgeLen,
+  };
+}
+
+/** Проверка: лежит ли точка на отрезке в XZ (перпендикуляр и параметр вдоль). */
+function groundPointOnSegment(
+  p: GroundPoint,
+  seg: GroundSegment,
+  epsDist = PROXIMITY_CORNER_ON_EDGE_EPS_M,
+  epsAlong = PROXIMITY_CORNER_ON_EDGE_EPS_M,
+): { on: boolean; perp: number; along: number; len: number } {
+  const dx = seg.end.x - seg.start.x;
+  const dz = seg.end.z - seg.start.z;
+  const len = Math.hypot(dx, dz);
+  if (len < 1e-9) {
+    return {
+      on: Math.hypot(p.x - seg.start.x, p.z - seg.start.z) <= epsDist,
+      perp: Math.hypot(p.x - seg.start.x, p.z - seg.start.z),
+      along: 0,
+      len: 0,
+    };
+  }
+  const ux = dx / len;
+  const uz = dz / len;
+  const along = (p.x - seg.start.x) * ux + (p.z - seg.start.z) * uz;
+  const qx = seg.start.x + ux * along;
+  const qz = seg.start.z + uz * along;
+  const perp = Math.hypot(p.x - qx, p.z - qz);
+  const on = perp <= epsDist && along >= -epsAlong && along <= len + epsAlong;
+  return { on, perp, along, len };
+}
+
+function proximitySegmentHighlightLineXZ(seg: GroundSegment, y: number): Float32Array {
+  return new Float32Array([
+    seg.start.x,
+    y,
+    seg.start.z,
+    seg.end.x,
+    y,
+    seg.end.z,
+  ]);
+}
+
+/** Минимальное расстояние до любого из отрезков границы следа (м). */
+function minDistanceToFootprintEdges(p: GroundPoint, corners: ModelGroundFootprint["corners"]) {
+  const segs = getFootprintEdgeSegments(corners);
+  let best = Number.POSITIVE_INFINITY;
+  for (const s of segs) {
+    const pr = getPointLineProjection(p, s);
+    if (!pr) continue;
+    const t = pr.projection;
+    let d: number;
+    if (t < 0) d = Math.hypot(p.x - s.start.x, p.z - s.start.z);
+    else if (t > pr.length) d = Math.hypot(p.x - s.end.x, p.z - s.end.z);
+    else d = pr.distance;
+    best = Math.min(best, d);
+  }
+  return best;
 }
 
 function getFootprintExtents(footprint: ModelGroundFootprint) {
@@ -564,9 +1406,81 @@ function formatMeters(value: number): string {
   return `${value.toFixed(2)}\u00A0м`;
 }
 
+/** Размерная линия между двумя точками на земле (как при трансформации): центры → точки, синий зазор, подпись. */
+function FootprintGapMeasurementVisual({
+  start,
+  end,
+  sourceCenter,
+  targetCenter,
+  label,
+  distance,
+}: Omit<MeasurementLine, "id">) {
+  return (
+    <group>
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            args={[new Float32Array([...sourceCenter, ...start]), 3]}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color="#334155" />
+      </line>
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            args={[new Float32Array([...targetCenter, ...end]), 3]}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color="#334155" />
+      </line>
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            args={[new Float32Array([...start, ...end]), 3]}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color="#3b82f6" />
+      </line>
+      <mesh position={start}>
+        <sphereGeometry args={[0.18, 18, 18]} />
+        <meshBasicMaterial color="#60a5fa" />
+      </mesh>
+      <mesh position={end}>
+        <sphereGeometry args={[0.18, 18, 18]} />
+        <meshBasicMaterial color="#22d3ee" />
+      </mesh>
+      <Html
+        position={label}
+        center
+        transform={false}
+        style={{ pointerEvents: "none", fontSize: "20px", lineHeight: "1.1" }}
+      >
+        <div className="whitespace-nowrap rounded-md border-2 border-cyan-200/90 bg-slate-950/95 px-3 py-1.5 text-sm font-bold tracking-[0.01em] text-cyan-100 shadow-[0_8px_24px_rgba(0,0,0,0.65)]">
+          {formatMeters(distance)}
+        </div>
+      </Html>
+    </group>
+  );
+}
+
 function geometryCacheKey(model: IfcModelItem): string {
   return `${model.name}:${model.size}:${model.file.lastModified}:${model.geometryRevision}`;
 }
+
+/** Tabler Icons outline: arrows-maximize — курсор для переноса в плоскости XY. */
+const CURSOR_TABLER_ARROWS_MAXIMIZE = (() => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M16 4l4 0l0 4" /><path d="M14 10l6 -6" /><path d="M8 20l-4 0l0 -4" /><path d="M4 20l6 -6" /><path d="M16 20l4 0l0 -4" /><path d="M14 14l6 6" /><path d="M8 4l-4 0l0 4" /><path d="M4 4l6 6" /></svg>`;
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 12 12, move`;
+})();
+
+/** Tabler Icons outline: rotate-360 — курсор для вращения. */
+const CURSOR_TABLER_ROTATE_360 = (() => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12 16h4v4" /><path d="M19.458 11.042c.86 -2.366 .722 -4.58 -.6 -5.9c-2.272 -2.274 -7.185 -1.045 -10.973 2.743c-3.788 3.788 -5.017 8.701 -2.744 10.974c2.227 2.226 6.987 1.093 10.74 -2.515" /></svg>`;
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 12 12, crosshair`;
+})();
 
 function disposeObjectResources(object: THREE.Object3D): void {
   const geometries = new Set<THREE.BufferGeometry>();
@@ -589,6 +1503,73 @@ function disposeObjectResources(object: THREE.Object3D): void {
   for (const material of materials) material.dispose();
 }
 
+/** Кольцевая дуга 90° в плоскости XZ (квадрант от осей xDir/zDir). */
+function createQuarterArcRingGeometry(
+  innerRadius: number,
+  outerRadius: number,
+  xDir: 1 | -1,
+  zDir: 1 | -1,
+  segments = 28,
+): THREE.BufferGeometry {
+  const positions: number[] = [];
+  const pushPoint = (radius: number, angle: number) => {
+    positions.push(
+      xDir * radius * Math.cos(angle),
+      0,
+      zDir * radius * Math.sin(angle),
+    );
+  };
+  for (let index = 0; index < segments; index += 1) {
+    const start = (index / segments) * (Math.PI / 2);
+    const end = ((index + 1) / segments) * (Math.PI / 2);
+    pushPoint(innerRadius, start);
+    pushPoint(outerRadius, start);
+    pushPoint(outerRadius, end);
+    pushPoint(innerRadius, start);
+    pushPoint(outerRadius, end);
+    pushPoint(innerRadius, end);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+/**
+ * Зона захвата по схеме: сектор от вершины (центр поворота в углу) до внешнего радиуса,
+ * тот же 90° что и у видимой дуги + небольшой угловой запас по краям.
+ */
+function createQuarterSectorHitGeometry(
+  outerRadius: number,
+  xDir: 1 | -1,
+  zDir: 1 | -1,
+  anglePadRad: number,
+  segments = 40,
+): THREE.BufferGeometry {
+  const angleStart = -anglePadRad;
+  const angleEnd = Math.PI / 2 + anglePadRad;
+  const positions: number[] = [];
+  const indices: number[] = [];
+  positions.push(0, 0, 0);
+  for (let i = 0; i <= segments; i += 1) {
+    const t = i / segments;
+    const angle = angleStart + t * (angleEnd - angleStart);
+    positions.push(
+      xDir * outerRadius * Math.cos(angle),
+      0,
+      zDir * outerRadius * Math.sin(angle),
+    );
+  }
+  for (let i = 0; i < segments; i += 1) {
+    indices.push(0, i + 1, i + 2);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setIndex(indices);
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
 function RotateCornerHandle({
   xDir,
   zDir,
@@ -596,7 +1577,6 @@ function RotateCornerHandle({
   innerRadius,
   thickness,
   active,
-  showLabel,
   onPointerDown,
   onPointerMove,
   onPointerUp,
@@ -610,7 +1590,6 @@ function RotateCornerHandle({
   innerRadius: number;
   thickness: number;
   active: boolean;
-  showLabel: boolean;
   onPointerDown: (event: ThreeEvent<PointerEvent>) => void;
   onPointerMove: (event: ThreeEvent<PointerEvent>) => void;
   onPointerUp: (event: ThreeEvent<PointerEvent>) => void;
@@ -618,43 +1597,72 @@ function RotateCornerHandle({
   onPointerOver: (event: ThreeEvent<PointerEvent>) => void;
   onPointerOut: (event: ThreeEvent<PointerEvent>) => void;
 }) {
-  const arcGeometry = useMemo(() => {
-    const segments = 28;
-    const outerRadius = innerRadius + thickness;
-    const positions: number[] = [];
+  const { invalidate } = useThree();
+  const groupRef = useRef<THREE.Group>(null);
+  const visualMeshRef = useRef<THREE.Mesh>(null);
+  const materialRef = useRef<THREE.MeshBasicMaterial>(null);
+  const highlightLerp = useRef(0);
+  const baseColor = useMemo(() => new THREE.Color(color), [color]);
+  const hotColor = useMemo(() => {
+    const c = new THREE.Color(color);
+    c.offsetHSL(0, 0.08, 0.14);
+    return c;
+  }, [color]);
 
-    const pushPoint = (radius: number, angle: number) => {
-      positions.push(
-        xDir * radius * Math.cos(angle),
-        0,
-        zDir * radius * Math.sin(angle),
-      );
-    };
+  useEffect(() => {
+    invalidate();
+  }, [active, invalidate]);
 
-    for (let index = 0; index < segments; index += 1) {
-      const start = (index / segments) * (Math.PI / 2);
-      const end = ((index + 1) / segments) * (Math.PI / 2);
+  // Видимая дуга не участвует в raycast — попадания по невидимому сектору от угла (см. схему зоны).
+  useEffect(() => {
+    const mesh = visualMeshRef.current;
+    if (!mesh) return;
+    mesh.raycast = () => {};
+  }, []);
 
-      pushPoint(innerRadius, start);
-      pushPoint(outerRadius, start);
-      pushPoint(outerRadius, end);
-
-      pushPoint(innerRadius, start);
-      pushPoint(outerRadius, end);
-      pushPoint(innerRadius, end);
+  useFrame((_, delta) => {
+    const target = active ? 1 : 0;
+    highlightLerp.current = THREE.MathUtils.lerp(
+      highlightLerp.current,
+      target,
+      1 - Math.exp(-14 * delta),
+    );
+    const h = highlightLerp.current;
+    if (groupRef.current) {
+      const s = THREE.MathUtils.lerp(1, 1.1, h);
+      groupRef.current.scale.setScalar(s);
     }
+    if (materialRef.current) {
+      materialRef.current.color.copy(baseColor).lerp(hotColor, h);
+      materialRef.current.opacity = THREE.MathUtils.lerp(0.78, 1, h);
+    }
+    if (Math.abs(highlightLerp.current - target) > 0.002) invalidate();
+  });
 
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
-    geometry.computeVertexNormals();
-    return geometry;
-  }, [innerRadius, thickness, xDir, zDir]);
+  const arcGeometry = useMemo(
+    () => createQuarterArcRingGeometry(innerRadius, innerRadius + thickness, xDir, zDir),
+    [innerRadius, thickness, xDir, zDir],
+  );
+
+  // Радиальный запас за внешней кромкой дуги; угловой — отдельно (сектор шире 90° на anglePad).
+  const hitPad = useMemo(
+    () => THREE.MathUtils.clamp(thickness * 0.65, 0.12, 0.42),
+    [thickness],
+  );
+  const angleHitPad = useMemo(
+    () => THREE.MathUtils.degToRad(THREE.MathUtils.clamp(thickness * 18, 4, 10)),
+    [thickness],
+  );
+  const hitGeometry = useMemo(() => {
+    const hitOuter = innerRadius + thickness + hitPad;
+    return createQuarterSectorHitGeometry(hitOuter, xDir, zDir, angleHitPad);
+  }, [innerRadius, thickness, hitPad, angleHitPad, xDir, zDir]);
 
   return (
-    <group>
+    <group ref={groupRef}>
       <mesh
-        geometry={arcGeometry}
-        renderOrder={18}
+        geometry={hitGeometry}
+        renderOrder={17}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -663,30 +1671,23 @@ function RotateCornerHandle({
         onPointerOut={onPointerOut}
       >
         <meshBasicMaterial
+          transparent
+          opacity={0}
+          depthTest={false}
+          depthWrite={false}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      <mesh ref={visualMeshRef} geometry={arcGeometry} renderOrder={18}>
+        <meshBasicMaterial
+          ref={materialRef}
           color={color}
           depthTest={false}
-          opacity={active ? 0.95 : 0.78}
+          opacity={0.78}
           side={THREE.DoubleSide}
           transparent
         />
       </mesh>
-
-      {showLabel && (
-        <Html
-          position={[
-            xDir * (innerRadius + thickness * 0.5) * Math.SQRT1_2,
-            0.22,
-            zDir * (innerRadius + thickness * 0.5) * Math.SQRT1_2,
-          ]}
-          center
-          transform={false}
-          style={{ pointerEvents: "none", fontSize: "18px", lineHeight: "1.1" }}
-        >
-          <div className="rounded-full border-2 border-slate-100/70 bg-slate-950/95 px-3 py-1.5 text-sm font-bold tracking-[0.01em] text-white shadow-[0_8px_22px_rgba(0,0,0,0.65)]">
-            Повернуть
-          </div>
-        </Html>
-      )}
     </group>
   );
 }
@@ -777,7 +1778,56 @@ function AlignmentPlaneHighlight({
   );
 }
 
-function ProximityHatchOverlay({ area }: { area: ProximityHatchArea }) {
+function ProximityHatchOverlay({
+  area,
+  footprints,
+  radialOrigin,
+  pixelOffset,
+  onPixelDragDelta,
+  showDebugCallout,
+}: {
+  area: ProximityHatchArea;
+  footprints: ModelGroundFootprint[];
+  radialOrigin: { x: number; z: number } | null;
+  pixelOffset: { x: number; y: number };
+  onPixelDragDelta: (id: string, dx: number, dy: number) => void;
+  showDebugCallout: boolean;
+}) {
+  const [hoverEdge, setHoverEdge] = useState<"source" | "target" | null>(null);
+
+  const handleCornerHover = useCallback((corner: "A" | "B" | "C" | "D" | null) => {
+    if (corner === null) {
+      setHoverEdge(null);
+      return;
+    }
+    setHoverEdge(corner === "A" || corner === "B" ? "source" : "target");
+  }, []);
+
+  const highlightSourcePositions = useMemo(
+    () => proximitySegmentHighlightLineXZ(area.source, PROXIMITY_EDGE_HIGHLIGHT_Y),
+    [area.source],
+  );
+  const highlightTargetPositions = useMemo(
+    () => proximitySegmentHighlightLineXZ(area.target, PROXIMITY_EDGE_HIGHLIGHT_Y + 0.006),
+    [area.target],
+  );
+
+  const proximityGapMeasurement = useMemo((): Omit<MeasurementLine, "id"> | null => {
+    const srcFp = footprints.find((f) => f.id === area.sourceModelId);
+    const tgtFp = footprints.find((f) => f.id === area.targetModelId);
+    if (!srcFp || !tgtFp) return null;
+    const start: [number, number, number] = [area.bridgeA.x, 0.04, area.bridgeA.z];
+    const end: [number, number, number] = [area.bridgeB.x, 0.04, area.bridgeB.z];
+    const sourceCenter: [number, number, number] = [srcFp.center.x, 0.03, srcFp.center.z];
+    const targetCenter: [number, number, number] = [tgtFp.center.x, 0.03, tgtFp.center.z];
+    const label: [number, number, number] = [
+      (start[0] + end[0]) * 0.5,
+      0.11,
+      (start[2] + end[2]) * 0.5,
+    ];
+    return { start, end, sourceCenter, targetCenter, label, distance: area.gapDistance };
+  }, [area, footprints]);
+
   const fillPositions = useMemo(() => {
     const [a, b, c, d] = area.corners;
     const y = 0.055;
@@ -870,6 +1920,43 @@ function ProximityHatchOverlay({ area }: { area: ProximityHatchArea }) {
         </bufferGeometry>
         <lineBasicMaterial color={PROXIMITY_HATCH_COLOR} opacity={0.75} transparent />
       </lineSegments>
+      {hoverEdge === "source" && (
+        <lineSegments renderOrder={32}>
+          <bufferGeometry>
+            <bufferAttribute attach="attributes-position" args={[highlightSourcePositions, 3]} />
+          </bufferGeometry>
+          <lineBasicMaterial
+            color={PROXIMITY_EDGE_HIGHLIGHT_COLOR}
+            depthTest
+            depthWrite={false}
+          />
+        </lineSegments>
+      )}
+      {hoverEdge === "target" && (
+        <lineSegments renderOrder={32}>
+          <bufferGeometry>
+            <bufferAttribute attach="attributes-position" args={[highlightTargetPositions, 3]} />
+          </bufferGeometry>
+          <lineBasicMaterial
+            color={PROXIMITY_EDGE_HIGHLIGHT_COLOR}
+            depthTest
+            depthWrite={false}
+          />
+        </lineSegments>
+      )}
+      {proximityGapMeasurement ? (
+        <FootprintGapMeasurementVisual {...proximityGapMeasurement} />
+      ) : null}
+      {showDebugCallout ? (
+        <ProximityHatchDebugLabel
+          area={area}
+          footprints={footprints}
+          radialOrigin={radialOrigin}
+          pixelOffset={pixelOffset}
+          onPixelDragDelta={onPixelDragDelta}
+          onHoverCornerSegment={handleCornerHover}
+        />
+      ) : null}
     </group>
   );
 }
@@ -940,6 +2027,7 @@ export default function IfcViewport({
   activeModelId,
   viewMode,
   transformMode,
+  devMode,
   rotationSnapEnabled,
   rotationSnapStepDegrees,
   onGeometryLoading,
@@ -955,6 +2043,10 @@ export default function IfcViewport({
   const [isSelected, setIsSelected] = useState(false);
   const [isTransforming, setIsTransforming] = useState(false);
   const [hoveredRotateHandleKey, setHoveredRotateHandleKey] = useState<string | null>(null);
+  /** Hover над телом активной модели в режиме переноса (плоскость XY). */
+  const [pointerOverMovePlane, setPointerOverMovePlane] = useState(false);
+  /** Активный drag переноса/вращения — для курсора Tabler на canvas. */
+  const [canvasGesture, setCanvasGesture] = useState<"move" | "rotate" | null>(null);
   const loadingKeysRef = useRef<Set<string>>(new Set());
   const loadingControllersRef = useRef<Map<string, AbortController>>(new Map());
   const progressUpdatesRef = useRef<Map<string, { at: number; value: number }>>(new Map());
@@ -969,6 +2061,10 @@ export default function IfcViewport({
   const instanceObjectsRef = useRef<Map<string, { geometryKey: string; object: THREE.Group }>>(
     new Map(),
   );
+  /** Актуальный список сцен — для магнита параллельных граней в handlePointerMove (объявлен ниже). */
+  const sceneModelsRef = useRef<
+    Array<{ model: IfcModelItem; object: THREE.Group; bounds: ModelBounds }>
+  >([]);
 
   useEffect(() => {
     cacheRef.current = cache;
@@ -990,8 +2086,32 @@ export default function IfcViewport({
     setDraftPlacement(activePlacement);
     dragStateRef.current = null;
     setIsTransforming(false);
+    setCanvasGesture(null);
+    setPointerOverMovePlane(false);
     setIsSelected(Boolean(activeModelId && activeModel?.isPlaced));
   }, [activeModel?.isPlaced, activePlacement, activeModelId]);
+
+  useEffect(() => {
+    const el = canvasElementRef.current;
+    if (!el) return;
+    if (canvasGesture === "move") {
+      el.style.cursor = CURSOR_TABLER_ARROWS_MAXIMIZE;
+      return;
+    }
+    if (canvasGesture === "rotate") {
+      el.style.cursor = CURSOR_TABLER_ROTATE_360;
+      return;
+    }
+    if (hoveredRotateHandleKey) {
+      el.style.cursor = CURSOR_TABLER_ROTATE_360;
+      return;
+    }
+    if (transformMode === "translate" && pointerOverMovePlane) {
+      el.style.cursor = CURSOR_TABLER_ARROWS_MAXIMIZE;
+      return;
+    }
+    el.style.cursor = "";
+  }, [canvasGesture, hoveredRotateHandleKey, transformMode, pointerOverMovePlane]);
 
   const activeGeometryEntry = useMemo(() => {
     if (!activeModelId || !activeModel?.isPlaced || activeModelStatus !== "ready") return null;
@@ -1173,6 +2293,7 @@ export default function IfcViewport({
         offsetZ: point.z - placement.z,
       };
 
+      setCanvasGesture("move");
       setCameraControlsEnabled(false);
       setIsTransforming(true);
       setIsSelected(true);
@@ -1204,6 +2325,7 @@ export default function IfcViewport({
         startRotation: placement.rotationY,
       };
 
+      setCanvasGesture("rotate");
       setCameraControlsEnabled(false);
       setIsTransforming(true);
       setIsSelected(true);
@@ -1254,6 +2376,37 @@ export default function IfcViewport({
     return { ...placement, x, z };
   }, []);
 
+  const applyParallelFaceMagnetToPlacement = useCallback(
+    (placement: IfcModelItem["placement"]): IfcModelItem["placement"] => {
+      if (!activeModelId) return placement;
+      const list = sceneModelsRef.current;
+      const entry = list.find((s) => s.model.id === activeModelId);
+      if (!entry) return placement;
+      const { corners } = computeWorldFootprintFromObject(entry.object, entry.bounds, placement);
+      const otherFootprints: ModelGroundFootprint[] = [];
+      for (const s of list) {
+        if (s.model.id === activeModelId) continue;
+        const p = s.model.placement;
+        const o = computeWorldFootprintFromObject(s.object, s.bounds, p);
+        otherFootprints.push({
+          id: s.model.id,
+          center: { x: p.x, z: p.z },
+          corners: o.corners,
+          minY: o.minY,
+          maxY: o.maxY,
+        });
+      }
+      const delta = computeParallelFaceMagnetDelta(corners, otherFootprints);
+      if (!delta) return placement;
+      return {
+        ...placement,
+        x: placement.x + delta.dx,
+        z: placement.z + delta.dz,
+      };
+    },
+    [activeModelId],
+  );
+
   const handlePointerMove = useCallback((event: ThreeEvent<PointerEvent>) => {
     const drag = dragStateRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
@@ -1287,12 +2440,14 @@ export default function IfcViewport({
               );
 
         if (nextDx === 0 && nextDz === 0) return previous;
-        return applyAlignmentSnap({
+        let next = applyAlignmentSnap({
           ...previous,
           x: previous.x + nextDx,
           y: 0,
           z: previous.z + nextDz,
         });
+        next = applyParallelFaceMagnetToPlacement(next);
+        return next;
       });
     } else {
       const angle = Math.atan2(point.z - drag.centerZ, point.x - drag.centerX);
@@ -1315,7 +2470,12 @@ export default function IfcViewport({
         };
       });
     }
-  }, [applyAlignmentSnap, rotationSnapEnabled, rotationSnapStepDegrees]);
+  }, [
+    applyAlignmentSnap,
+    applyParallelFaceMagnetToPlacement,
+    rotationSnapEnabled,
+    rotationSnapStepDegrees,
+  ]);
 
   const endDrag = useCallback((event: ThreeEvent<PointerEvent>) => {
     const drag = dragStateRef.current;
@@ -1328,6 +2488,7 @@ export default function IfcViewport({
     currentTarget.releasePointerCapture?.(event.pointerId);
 
     dragStateRef.current = null;
+    setCanvasGesture(null);
     setIsTransforming(false);
     setCameraControlsEnabled(true);
     commitPlacement();
@@ -1392,47 +2553,14 @@ export default function IfcViewport({
     return activeGeometryEntry?.bounds ?? null;
   }, [activeGeometryEntry]);
 
-  const selectionOutlinePositions = useMemo(() => {
-    if (!selectionBounds) return null;
-    return new Float32Array([
-      selectionBounds.minX,
-      0,
-      selectionBounds.minZ,
-      selectionBounds.maxX,
-      0,
-      selectionBounds.minZ,
-
-      selectionBounds.maxX,
-      0,
-      selectionBounds.minZ,
-      selectionBounds.maxX,
-      0,
-      selectionBounds.maxZ,
-
-      selectionBounds.maxX,
-      0,
-      selectionBounds.maxZ,
-      selectionBounds.minX,
-      0,
-      selectionBounds.maxZ,
-
-      selectionBounds.minX,
-      0,
-      selectionBounds.maxZ,
-      selectionBounds.minX,
-      0,
-      selectionBounds.minZ,
-    ]);
-  }, [selectionBounds]);
-
   const cornerHandles = useMemo(() => {
     if (!selectionBounds) return [] as Array<[number, number, number]>;
-    const { minX, maxX, minZ, maxZ } = selectionBounds;
+    const { minX, maxX, minZ, maxZ, minY } = selectionBounds;
     return [
-      [minX, 0, minZ],
-      [maxX, 0, minZ],
-      [maxX, 0, maxZ],
-      [minX, 0, maxZ],
+      [minX, minY, minZ],
+      [maxX, minY, minZ],
+      [maxX, minY, maxZ],
+      [minX, minY, maxZ],
     ];
   }, [selectionBounds]);
 
@@ -1447,20 +2575,6 @@ export default function IfcViewport({
   const rotateHandleThickness = useMemo(() => {
     return THREE.MathUtils.clamp(rotateHandleInnerRadius * 0.32, 0.18, 0.36);
   }, [rotateHandleInnerRadius]);
-
-  const moveHandles = useMemo(() => {
-    if (!selectionBounds) return [] as Array<[number, number, number]>;
-    const { minX, maxX, minZ, maxZ } = selectionBounds;
-    const cx = (minX + maxX) / 2;
-    const cz = (minZ + maxZ) / 2;
-    return [
-      [cx, 0, cz],
-      [minX, 0, cz],
-      [maxX, 0, cz],
-      [cx, 0, minZ],
-      [cx, 0, maxZ],
-    ];
-  }, [selectionBounds]);
 
   const sceneModels = useMemo(
     () => {
@@ -1502,28 +2616,20 @@ export default function IfcViewport({
     },
     [cache, models],
   );
+  sceneModelsRef.current = sceneModels;
 
   const sceneGroundFootprints = useMemo(() => {
     return sceneModels
-      .map(({ model: sceneModel, bounds }) => {
+      .map(({ model: sceneModel, bounds, object }) => {
         const placement = activeModelId === sceneModel.id ? draftPlacement : sceneModel.placement;
-
-        const localCorners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint] = [
-          { x: bounds.minX, z: bounds.minZ },
-          { x: bounds.maxX, z: bounds.minZ },
-          { x: bounds.maxX, z: bounds.maxZ },
-          { x: bounds.minX, z: bounds.maxZ },
-        ];
-        const corners = localCorners.map((point) =>
-          transformLocalGroundPoint(point, placement),
-        ) as [GroundPoint, GroundPoint, GroundPoint, GroundPoint];
+        const { corners, minY, maxY } = computeWorldFootprintFromObject(object, bounds, placement);
 
         return {
           id: sceneModel.id,
           center: { x: placement.x, z: placement.z },
           corners,
-          minY: bounds.minY + placement.y,
-          maxY: bounds.maxY + placement.y,
+          minY,
+          maxY,
         } satisfies ModelGroundFootprint;
       })
       .filter((value): value is ModelGroundFootprint => Boolean(value));
@@ -1533,6 +2639,31 @@ export default function IfcViewport({
     () => sceneGroundFootprints.find((item) => item.id === activeModelId) ?? null,
     [activeModelId, sceneGroundFootprints],
   );
+
+  /** Центр кластера следов на земле — от него выносим отладочные панели «наружу». */
+  const sceneDebugRadialOrigin = useMemo((): { x: number; z: number } | null => {
+    if (sceneGroundFootprints.length === 0) return null;
+    let sx = 0;
+    let sz = 0;
+    for (const fp of sceneGroundFootprints) {
+      const e = getFootprintExtents(fp);
+      sx += (e.minX + e.maxX) * 0.5;
+      sz += (e.minZ + e.maxZ) * 0.5;
+    }
+    const n = sceneGroundFootprints.length;
+    return { x: sx / n, z: sz / n };
+  }, [sceneGroundFootprints]);
+
+  const [debugCalloutPixelOffsets, setDebugCalloutPixelOffsets] = useState<
+    Record<string, { x: number; y: number }>
+  >({});
+
+  const shiftDebugCalloutPixels = useCallback((id: string, dx: number, dy: number) => {
+    setDebugCalloutPixelOffsets((prev) => ({
+      ...prev,
+      [id]: { x: (prev[id]?.x ?? 0) + dx, y: (prev[id]?.y ?? 0) + dy },
+    }));
+  }, []);
 
   useEffect(() => {
     if (!activeModelId || !activeGroundFootprint) {
@@ -1570,7 +2701,10 @@ export default function IfcViewport({
   }, [activeGroundFootprint, activeModelId, sceneGroundFootprints]);
 
   const proximityHatchAreas = useMemo(() => {
-    if (!activeModelId || !activeGroundFootprint || !isTransforming) {
+    if (!activeModelId || !activeGroundFootprint) {
+      return [] as ProximityHatchArea[];
+    }
+    if (!PROXIMITY_HATCH_ALWAYS_ON && !isTransforming) {
       return [] as ProximityHatchArea[];
     }
 
@@ -1579,27 +2713,48 @@ export default function IfcViewport({
     return sceneGroundFootprints
       .filter((footprint) => footprint.id !== activeModelId)
       .map((footprint) => {
-        let bestArea: ProximityHatchArea | null = null;
-        let bestScore = Number.POSITIVE_INFINITY;
+        const otherEdges = getFootprintEdgeSegments(footprint.corners);
+        const candidates: Array<{
+          distSq: number;
+          source: GroundSegment;
+          target: GroundSegment;
+        }> = [];
 
         for (const source of activeEdges) {
-          for (const target of getFootprintEdgeSegments(footprint.corners)) {
-            if (getParallelDelta(source, target) > PROXIMITY_HATCH_EDGE_TOLERANCE) continue;
-            const area = buildProximityHatchArea(
-              source,
-              target,
-              `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}:hatch`,
+          for (const target of otherEdges) {
+            const bridgeSeg = closestPointsOnSegments2D(
+              source.start,
+              source.end,
+              target.start,
+              target.end,
             );
-            if (!area) continue;
+            candidates.push({ distSq: bridgeSeg.distanceSq, source, target });
+          }
+        }
+        candidates.sort((a, b) => a.distSq - b.distSq);
 
-            const score = getParallelLineDistance(source, target);
-            if (score >= bestScore) continue;
-            bestScore = score;
-            bestArea = area;
+        for (const { distSq, source, target } of candidates) {
+          const gap = Math.sqrt(distSq);
+          if (gap > PROXIMITY_HATCH_DISTANCE) break;
+          // Первая по distSq пара может быть касание угла (gap≈0), а реальный зазор — у другой пары рёбер.
+          if (gap <= 1e-6) continue;
+          if (getParallelDelta(source, target) > PROXIMITY_HATCH_EDGE_TOLERANCE) continue;
+
+          const area = buildProximityHatchArea(
+            source,
+            target,
+            `${activeModelId}:${footprint.id}:${source.edge}:${target.edge}:hatch`,
+          );
+          if (area) {
+            return {
+              ...area,
+              sourceModelId: activeModelId,
+              targetModelId: footprint.id,
+            };
           }
         }
 
-        return bestArea;
+        return null;
       })
       .filter((area): area is ProximityHatchArea => Boolean(area));
   }, [activeGroundFootprint, activeModelId, isTransforming, sceneGroundFootprints]);
@@ -1766,7 +2921,6 @@ export default function IfcViewport({
   }, [activeModel, activeObject, models, progressById]);
 
   const rotateHandleColor = SELECTION_ACCENT_COLOR;
-  const moveHandleColor = transformMode === "translate" ? "#22c55e" : "#4ade80";
 
   return (
     <div
@@ -1784,7 +2938,10 @@ export default function IfcViewport({
           canvasElementRef.current = gl.domElement;
         }}
         onPointerMissed={() => {
-          if (!dragStateRef.current) setIsSelected(false);
+          if (!dragStateRef.current) {
+            setIsSelected(false);
+            setPointerOverMovePlane(false);
+          }
         }}
       >
         <color attach="background" args={["#020617"]} />
@@ -1793,7 +2950,7 @@ export default function IfcViewport({
         <directionalLight position={[-18, 8, -12]} intensity={0.4} />
         <gridHelper args={[200, 60, "#475569", "#1e293b"]} />
 
-        {sceneModels.map(({ model: sceneModel, object }) => {
+        {sceneModels.map(({ model: sceneModel, object, bounds }) => {
           const isActive = activeModelId === sceneModel.id;
           const placement = isActive ? draftPlacement : sceneModel.placement;
 
@@ -1820,131 +2977,117 @@ export default function IfcViewport({
                   }
                   if (transformMode === "translate") beginMoveDrag(event);
                 }}
+                onPointerOver={(event: ThreeEvent<PointerEvent>) => {
+                  if (!isActive || transformMode !== "translate") return;
+                  event.stopPropagation();
+                  setPointerOverMovePlane(true);
+                }}
+                onPointerOut={(event: ThreeEvent<PointerEvent>) => {
+                  if (!isActive) return;
+                  event.stopPropagation();
+                  setPointerOverMovePlane(false);
+                }}
                 onPointerMove={handlePointerMove}
                 onPointerUp={endDrag}
                 onPointerCancel={endDrag}
               />
 
-              {isActive && isSelected && selectionBounds && selectionOutlinePositions && (
-                <>
-                  <line>
-                    <bufferGeometry>
-                      <bufferAttribute
-                        attach="attributes-position"
-                        args={[selectionOutlinePositions, 3]}
-                      />
-                    </bufferGeometry>
-                    <lineBasicMaterial color={SELECTION_ACCENT_COLOR} linewidth={1} />
-                  </line>
+              <group
+                position={[object.position.x, object.position.y, object.position.z]}
+                rotation={[object.rotation.x, object.rotation.y, object.rotation.z]}
+                scale={[object.scale.x, object.scale.y, object.scale.z]}
+              >
+                {devMode ? (
+                  <NonPickableFootprintOutline
+                    bounds={bounds}
+                    color={ALL_MODELS_BOUNDS_OUTLINE_COLOR}
+                  />
+                ) : null}
 
-                  {moveHandles.map((pos, index) => (
-                    <mesh
-                      key={`move-${index}`}
-                      position={[pos[0], 0.05, pos[2]]}
-                      onPointerDown={beginMoveDrag}
-                      onPointerMove={handlePointerMove}
-                      onPointerUp={endDrag}
-                      onPointerCancel={endDrag}
-                    >
-                      <sphereGeometry args={[0.18, 16, 16]} />
-                      <meshBasicMaterial color={moveHandleColor} />
-                    </mesh>
-                  ))}
+                {isActive && isSelected && selectionBounds && (
+                  <>
+                    <NonPickableFootprintOutline
+                      bounds={selectionBounds}
+                      color={SELECTION_ACCENT_COLOR}
+                    />
 
-                  {cornerHandles.map((pos, index) => {
-                    const handleKey = `${activeModelId ?? "no-model"}:${index}`;
-                    const isMinX = pos[0] <= selectionBounds.minX + 0.0001;
-                    const isMinZ = pos[2] <= selectionBounds.minZ + 0.0001;
-                    const xDir: 1 | -1 = isMinX ? -1 : 1;
-                    const zDir: 1 | -1 = isMinZ ? -1 : 1;
-                    return (
-                      <group
-                        key={`rotate-${index}`}
-                        position={[pos[0], 0.08, pos[2]]}
-                      >
-                        <RotateCornerHandle
-                          xDir={xDir}
-                          zDir={zDir}
-                          color={rotateHandleColor}
-                          innerRadius={rotateHandleInnerRadius}
-                          thickness={rotateHandleThickness}
-                          active={hoveredRotateHandleKey === handleKey}
-                          showLabel={hoveredRotateHandleKey === handleKey}
-                          onPointerDown={beginRotateDrag}
-                          onPointerMove={handlePointerMove}
-                          onPointerUp={endDrag}
-                          onPointerCancel={endDrag}
-                          onPointerOver={(event: ThreeEvent<PointerEvent>) => {
-                            event.stopPropagation();
-                            setHoveredRotateHandleKey(handleKey);
-                          }}
-                          onPointerOut={(event: ThreeEvent<PointerEvent>) => {
-                            event.stopPropagation();
-                            setHoveredRotateHandleKey((current) =>
-                              current === handleKey ? null : current,
-                            );
-                          }}
-                        />
-                      </group>
-                    );
-                  })}
-                </>
-              )}
+                    {cornerHandles.map((pos, index) => {
+                      const handleKey = `${activeModelId ?? "no-model"}:${index}`;
+                      const isMinX = pos[0] <= selectionBounds.minX + 0.0001;
+                      const isMinZ = pos[2] <= selectionBounds.minZ + 0.0001;
+                      const xDir: 1 | -1 = isMinX ? -1 : 1;
+                      const zDir: 1 | -1 = isMinZ ? -1 : 1;
+                      return (
+                        <group
+                          key={`rotate-${index}`}
+                          position={[pos[0], pos[1] + 0.08, pos[2]]}
+                        >
+                          <RotateCornerHandle
+                            xDir={xDir}
+                            zDir={zDir}
+                            color={rotateHandleColor}
+                            innerRadius={rotateHandleInnerRadius}
+                            thickness={rotateHandleThickness}
+                            active={hoveredRotateHandleKey === handleKey}
+                            onPointerDown={beginRotateDrag}
+                            onPointerMove={handlePointerMove}
+                            onPointerUp={endDrag}
+                            onPointerCancel={endDrag}
+                            onPointerOver={(event: ThreeEvent<PointerEvent>) => {
+                              event.stopPropagation();
+                              setHoveredRotateHandleKey(handleKey);
+                            }}
+                            onPointerOut={(event: ThreeEvent<PointerEvent>) => {
+                              event.stopPropagation();
+                              setHoveredRotateHandleKey((current) =>
+                                current === handleKey ? null : current,
+                              );
+                            }}
+                          />
+                        </group>
+                      );
+                    })}
+                  </>
+                )}
+              </group>
+
+              {devMode ? (
+                <ModelDebugCallout
+                  model={sceneModel}
+                  bounds={bounds}
+                  object={object}
+                  placement={placement}
+                  radialOrigin={sceneDebugRadialOrigin}
+                  pixelOffset={debugCalloutPixelOffsets[sceneModel.id] ?? { x: 0, y: 0 }}
+                  onPixelDragDelta={shiftDebugCalloutPixels}
+                />
+              ) : null}
             </group>
           );
         })}
 
         {proximityHatchAreas.map((area) => (
-          <ProximityHatchOverlay key={area.id} area={area} />
+          <ProximityHatchOverlay
+            key={area.id}
+            area={area}
+            footprints={sceneGroundFootprints}
+            radialOrigin={sceneDebugRadialOrigin}
+            pixelOffset={debugCalloutPixelOffsets[area.id] ?? { x: 0, y: 0 }}
+            onPixelDragDelta={shiftDebugCalloutPixels}
+            showDebugCallout={devMode}
+          />
         ))}
 
         {measurementLines.map((line) => (
           <group key={line.id}>
-            <line>
-              <bufferGeometry>
-                <bufferAttribute
-                  attach="attributes-position"
-                  args={[new Float32Array([...line.sourceCenter, ...line.start]), 3]}
-                />
-              </bufferGeometry>
-              <lineBasicMaterial color="#334155" />
-            </line>
-            <line>
-              <bufferGeometry>
-                <bufferAttribute
-                  attach="attributes-position"
-                  args={[new Float32Array([...line.targetCenter, ...line.end]), 3]}
-                />
-              </bufferGeometry>
-              <lineBasicMaterial color="#334155" />
-            </line>
-            <line>
-              <bufferGeometry>
-                <bufferAttribute
-                  attach="attributes-position"
-                  args={[new Float32Array([...line.start, ...line.end]), 3]}
-                />
-              </bufferGeometry>
-              <lineBasicMaterial color="#3b82f6" />
-            </line>
-            <mesh position={line.start}>
-              <sphereGeometry args={[0.18, 18, 18]} />
-              <meshBasicMaterial color="#60a5fa" />
-            </mesh>
-            <mesh position={line.end}>
-              <sphereGeometry args={[0.18, 18, 18]} />
-              <meshBasicMaterial color="#22d3ee" />
-            </mesh>
-            <Html
-              position={line.label}
-              center
-              transform={false}
-              style={{ pointerEvents: "none", fontSize: "20px", lineHeight: "1.1" }}
-            >
-              <div className="whitespace-nowrap rounded-md border-2 border-cyan-200/90 bg-slate-950/95 px-3 py-1.5 text-sm font-bold tracking-[0.01em] text-cyan-100 shadow-[0_8px_24px_rgba(0,0,0,0.65)]">
-                {formatMeters(line.distance)}
-              </div>
-            </Html>
+            <FootprintGapMeasurementVisual
+              start={line.start}
+              end={line.end}
+              sourceCenter={line.sourceCenter}
+              targetCenter={line.targetCenter}
+              label={line.label}
+              distance={line.distance}
+            />
           </group>
         ))}
 
