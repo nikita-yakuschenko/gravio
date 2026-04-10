@@ -9,8 +9,226 @@ import type {
 
 export type { BuildNanoBananaPromptInput, NanoBananaCameraSnapshot, PlacedModelSnapshot };
 
+/** Жёсткий лимит длины строки промпта для генераторов (символов Unicode). */
+export const MAX_NANO_BANANA_PROMPT_CHARS = 10000;
+
+/** Запас под поля meta (promptMaxChars, promptTextBudgetPerField, …) после ужимания текста. */
+const RESERVED_FOR_FINAL_META = 380;
+
 function round6(n: number): number {
   return Math.round(n * 1e6) / 1e6;
+}
+
+const TRUNC_SUFFIX = "…[усечено по лимиту]";
+
+function truncatePromptText(s: string, maxChars: number): string {
+  if (s.length <= maxChars) return s;
+  const n = Math.max(0, maxChars - TRUNC_SUFFIX.length);
+  return (n > 0 ? s.slice(0, n) : "") + TRUNC_SUFFIX;
+}
+
+type GravioSceneShape = {
+  architecturalModels?: Array<{
+    reconstructionPromptRu?: string;
+    reconstructionPromptEn?: string;
+    geometryMesh?: unknown;
+    ifcAnalysis?: unknown;
+  }>;
+  reconstruction?: {
+    summaryRu?: string;
+    summaryEn?: string;
+    perModelPrompts?: unknown;
+  };
+};
+
+/** Убирает дубликаты и тяжёлые необязательные поля перед подсчётом длины. */
+function preparePayloadForPromptSizing(payload: Record<string, unknown>): void {
+  const g = payload.gravio as { scene?: GravioSceneShape } | undefined;
+  const s = g?.scene;
+  if (!s) return;
+  // Дублирует тексты из architecturalModels — экономим место при ужимании.
+  if (s.reconstruction && "perModelPrompts" in s.reconstruction) {
+    delete s.reconstruction.perModelPrompts;
+  }
+  const models = s.architecturalModels;
+  if (!models) return;
+  for (const m of models) {
+    delete m.geometryMesh;
+    delete m.ifcAnalysis;
+  }
+}
+
+function applyTextBudgetToPayload(payload: Record<string, unknown>, maxCharsPerField: number): void {
+  const ng = payload.narrative_guide as { ru?: string; en?: string } | undefined;
+  if (ng?.ru) ng.ru = truncatePromptText(ng.ru, maxCharsPerField);
+  if (ng?.en) ng.en = truncatePromptText(ng.en, maxCharsPerField);
+
+  const scene = (payload.gravio as { scene?: GravioSceneShape } | undefined)?.scene;
+  if (scene?.reconstruction) {
+    const r = scene.reconstruction;
+    if (r.summaryRu) r.summaryRu = truncatePromptText(r.summaryRu, maxCharsPerField + 400);
+    if (r.summaryEn) r.summaryEn = truncatePromptText(r.summaryEn, maxCharsPerField + 400);
+  }
+  const models = scene?.architecturalModels;
+  if (models) {
+    for (const m of models) {
+      if (m.reconstructionPromptRu)
+        m.reconstructionPromptRu = truncatePromptText(m.reconstructionPromptRu, maxCharsPerField);
+      if (m.reconstructionPromptEn)
+        m.reconstructionPromptEn = truncatePromptText(m.reconstructionPromptEn, maxCharsPerField);
+    }
+  }
+}
+
+function compactJsonLength(payload: Record<string, unknown>): number {
+  return JSON.stringify(payload).length;
+}
+
+/**
+ * Подбирает максимальный лимит символов на текстовое поле так, чтобы JSON без отступов
+ * укладывался в maxTotalChars.
+ */
+function maxTextBudgetForCompactJson(payload: Record<string, unknown>, maxTotalChars: number): number {
+  let lo = 0;
+  let hi = 12000;
+  let best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const trial = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+    applyTextBudgetToPayload(trial, mid);
+    if (compactJsonLength(trial) <= maxTotalChars) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
+type MinimalArch = {
+  id: string;
+  name: string;
+  placement: unknown;
+  localRootBounds: unknown;
+  reconstructionPromptRu: string;
+  reconstructionPromptEn: string;
+};
+
+/** Крайний случай: только ключевые поля по моделям (лимиты подбираются снаружи). */
+function buildEmergencyMinimalPayload(
+  source: Record<string, unknown>,
+  limits: {
+    objective: number;
+    narrative: number;
+    modelRu: number;
+    modelEn: number;
+  },
+): Record<string, unknown> {
+  const g = source.gravio as {
+    environment?: unknown;
+    camera_detail?: unknown;
+    scene?: GravioSceneShape & { placedModels?: unknown };
+    generation?: unknown;
+  };
+  const models = g?.scene?.architecturalModels ?? [];
+  const tiny: MinimalArch[] = models.map((m) => ({
+    id: String((m as { id?: string }).id ?? ""),
+    name: String((m as { name?: string }).name ?? ""),
+    placement: (m as { placement?: unknown }).placement,
+    localRootBounds: (m as { localRootBounds?: unknown }).localRootBounds,
+    reconstructionPromptRu: truncatePromptText(String((m as { reconstructionPromptRu?: string }).reconstructionPromptRu ?? ""), limits.modelRu),
+    reconstructionPromptEn: truncatePromptText(String((m as { reconstructionPromptEn?: string }).reconstructionPromptEn ?? ""), limits.modelEn),
+  }));
+  return {
+    prompt_type: source.prompt_type,
+    version: source.version,
+    objective: truncatePromptText(String(source.objective ?? ""), limits.objective),
+    strict_requirements: source.strict_requirements,
+    creative_enhancement: source.creative_enhancement,
+    narrative_guide: {
+      ru: truncatePromptText(String((source.narrative_guide as { ru?: string })?.ru ?? ""), limits.narrative),
+      en: truncatePromptText(String((source.narrative_guide as { en?: string })?.en ?? ""), limits.narrative),
+    },
+    source_scene: source.source_scene,
+    camera: source.camera,
+    render_style: source.render_style,
+    meta: {
+      ...(source.meta as object),
+      promptMaxChars: MAX_NANO_BANANA_PROMPT_CHARS,
+      promptEmergencyMinimal: true,
+    },
+    gravio: {
+      environment: g?.environment,
+      camera_detail: g?.camera_detail,
+      scene: {
+        units: "meters",
+        placedModels: g?.scene?.placedModels,
+        architecturalModels: tiny,
+      },
+      generation: g?.generation,
+    },
+  };
+}
+
+function shrinkEmergencyUntilFits(source: Record<string, unknown>): Record<string, unknown> {
+  const cap = MAX_NANO_BANANA_PROMPT_CHARS - RESERVED_FOR_FINAL_META;
+  const tiers = [
+    { objective: 900, narrative: 1200, modelRu: 400, modelEn: 400 },
+    { objective: 600, narrative: 800, modelRu: 280, modelEn: 280 },
+    { objective: 400, narrative: 500, modelRu: 180, modelEn: 180 },
+    { objective: 280, narrative: 320, modelRu: 120, modelEn: 120 },
+    { objective: 200, narrative: 220, modelRu: 80, modelEn: 80 },
+    { objective: 120, narrative: 140, modelRu: 50, modelEn: 50 },
+  ];
+  for (const lim of tiers) {
+    const p = buildEmergencyMinimalPayload(source, lim);
+    if (compactJsonLength(p) <= cap) return p;
+  }
+  return buildEmergencyMinimalPayload(source, { objective: 80, narrative: 100, modelRu: 40, modelEn: 40 });
+}
+
+/**
+ * Сериализует промпт с гарантией: длина строки ≤ MAX_NANO_BANANA_PROMPT_CHARS.
+ * Сначала сохраняется максимум текста (бинарный поиск лимита полей), затем при необходимости — компактный JSON.
+ */
+export function finalizeNanoBananaPromptString(payload: Record<string, unknown>): string {
+  const base = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+  preparePayloadForPromptSizing(base);
+
+  const uncompressedCompactLen = compactJsonLength(base);
+  const budget = maxTextBudgetForCompactJson(
+    base,
+    MAX_NANO_BANANA_PROMPT_CHARS - RESERVED_FOR_FINAL_META,
+  );
+  applyTextBudgetToPayload(base, budget);
+
+  let working: Record<string, unknown> = base;
+  let usedEmergency = false;
+  if (compactJsonLength(working) > MAX_NANO_BANANA_PROMPT_CHARS - RESERVED_FOR_FINAL_META) {
+    working = shrinkEmergencyUntilFits(working);
+    usedEmergency = true;
+  }
+
+  const meta = (working.meta as Record<string, unknown> | undefined) ?? {};
+  working.meta = {
+    ...meta,
+    promptMaxChars: MAX_NANO_BANANA_PROMPT_CHARS,
+    promptTextBudgetPerField: budget,
+    promptTruncated: uncompressedCompactLen > MAX_NANO_BANANA_PROMPT_CHARS || usedEmergency,
+    promptEmergencyMinimal: usedEmergency,
+  };
+
+  let compact = JSON.stringify(working);
+  // На случай если служебные поля meta пересекли лимит — укорачиваем meta (без поломки JSON).
+  if (compact.length > MAX_NANO_BANANA_PROMPT_CHARS) {
+    const m = working.meta as Record<string, unknown>;
+    delete m.promptTextBudgetPerField;
+    compact = JSON.stringify(working);
+  }
+  const pretty = JSON.stringify(working, null, 2);
+  if (pretty.length <= MAX_NANO_BANANA_PROMPT_CHARS) return pretty;
+  return compact;
 }
 
 /**
@@ -119,7 +337,7 @@ export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): st
     },
   };
 
-  return JSON.stringify(payload, null, 2);
+  return finalizeNanoBananaPromptString(payload as Record<string, unknown>);
 }
 
 export function collectPlacedModelSnapshots(
