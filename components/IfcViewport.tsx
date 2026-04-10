@@ -2327,6 +2327,9 @@ export default function IfcViewport({
   const placementGroupRef = useRef<THREE.Group | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
   const cameraRef = useRef<THREE.Camera | null>(null);
+  /** Для явного gl.render перед снимком в буфер (frameloop: demand). */
+  const glRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
   const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
   const raycasterRef = useRef(new THREE.Raycaster());
   const alignmentSnapRef = useRef<AlignmentSnapData | null>(null);
@@ -3248,6 +3251,7 @@ export default function IfcViewport({
   const rotateHandleColor = SELECTION_ACCENT_COLOR;
 
   const [nanoBananaFeedback, setNanoBananaFeedback] = useState<string | null>(null);
+  const [viewportSnapshotFeedback, setViewportSnapshotFeedback] = useState<string | null>(null);
 
   const handleCopyNanoBananaPrompt = useCallback(async () => {
     const canvas = canvasElementRef.current;
@@ -3309,6 +3313,52 @@ export default function IfcViewport({
     setTimeout(() => setNanoBananaFeedback(null), 3200);
   }, [activeModelId, draftPlacement, models, viewMode]);
 
+  const handleCopyViewportSnapshot = useCallback(async () => {
+    const gl = glRef.current;
+    const scene = sceneRef.current;
+    const cam = cameraRef.current;
+    const canvas = canvasElementRef.current;
+    if (!gl || !scene || !cam || !canvas) {
+      setViewportSnapshotFeedback("Сцена не готова");
+      setTimeout(() => setViewportSnapshotFeedback(null), 3200);
+      return;
+    }
+
+    try {
+      controlsRef.current?.update();
+      gl.render(scene, cam);
+      await new Promise((r) => requestAnimationFrame(r));
+
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (b) => {
+            if (b) resolve(b);
+            else reject(new Error("toBlob"));
+          },
+          "image/png",
+          0.94,
+        );
+      });
+
+      if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        setViewportSnapshotFeedback("Изображение скопировано в буфер");
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `gravio-viewport-${Date.now()}.png`;
+        a.rel = "noopener";
+        a.click();
+        URL.revokeObjectURL(url);
+        setViewportSnapshotFeedback("Скачано PNG (буфер изображений недоступен)");
+      }
+    } catch {
+      setViewportSnapshotFeedback("Не удалось получить снимок");
+    }
+    setTimeout(() => setViewportSnapshotFeedback(null), 3200);
+  }, []);
+
   return (
     <div
       className="relative h-full w-full bg-[#9fbfcf]"
@@ -3319,9 +3369,15 @@ export default function IfcViewport({
         dpr={[1, 1.5]}
         frameloop="demand"
         camera={{ position: [15, 12, 15], fov: 45, near: 0.1, far: 20000 }}
-        gl={{ antialias: true, powerPreference: "high-performance" }}
-        onCreated={({ camera, gl }) => {
+        gl={{
+          antialias: true,
+          powerPreference: "high-performance",
+          preserveDrawingBuffer: true,
+        }}
+        onCreated={({ camera, gl, scene }) => {
           cameraRef.current = camera;
+          glRef.current = gl;
+          sceneRef.current = scene;
           canvasElementRef.current = gl.domElement;
           gl.toneMapping = THREE.ACESFilmicToneMapping;
           gl.toneMappingExposure = VIEWPORT_OUTDOOR_SPEC.renderer.toneMappingExposure;
@@ -3575,9 +3631,22 @@ export default function IfcViewport({
         >
           NanoBanana JSON
         </button>
+        <button
+          type="button"
+          className="pointer-events-auto rounded-lg border border-slate-600/80 bg-slate-900/85 px-3 py-1.5 text-xs font-medium text-slate-100 shadow-md backdrop-blur-sm transition-colors hover:border-cyan-500/60 hover:bg-slate-900 hover:text-white"
+          title="Снимок только 3D-сцены (без кнопок и HTML-панелей), PNG в буфер обмена"
+          onClick={() => void handleCopyViewportSnapshot()}
+        >
+          Снимок в буфер
+        </button>
         {nanoBananaFeedback ? (
-          <span className="pointer-events-none max-w-[220px] rounded bg-slate-950/90 px-2 py-1 text-[11px] text-emerald-300 shadow">
+          <span className="pointer-events-none max-w-[240px] rounded bg-slate-950/90 px-2 py-1 text-[11px] text-emerald-300 shadow">
             {nanoBananaFeedback}
+          </span>
+        ) : null}
+        {viewportSnapshotFeedback ? (
+          <span className="pointer-events-none max-w-[240px] rounded bg-slate-950/90 px-2 py-1 text-[11px] text-sky-300 shadow">
+            {viewportSnapshotFeedback}
           </span>
         ) : null}
       </div>
