@@ -3,7 +3,6 @@
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { analyzeIfcFile } from "@/lib/ifc/analyzeIfcFile";
 import { useIfcStore } from "@/store/ifcStore";
 import type { IfcModelItem, IfcPlacement } from "@/types/ifc";
 
@@ -99,6 +98,7 @@ export default function AppShell() {
 
     (async () => {
       try {
+        const { analyzeIfcFile } = await import("@/lib/ifc/analyzeIfcFile");
         const analysis = await analyzeIfcFile(next.file);
         setAnalysisResult(next.id, analysis);
       } catch (error) {

@@ -26,6 +26,16 @@ interface Props {
 interface CacheEntry {
   object: THREE.Group;
   stats: NonNullable<IfcModelItem["geometryStats"]>;
+  bounds: ModelBounds;
+}
+
+interface ModelBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  minZ: number;
+  maxZ: number;
 }
 
 interface GroundPoint {
@@ -122,6 +132,7 @@ const ALIGNMENT_PLANE_COLOR = "#ec4899";
 const PROXIMITY_HATCH_DISTANCE = 6;
 const PROXIMITY_HATCH_STEP = 0.35;
 const PROXIMITY_HATCH_COLOR = "#ec4899";
+const SELECTION_ACCENT_COLOR = "#0173F7";
 
 function normalizeAngle(angle: number): number {
   let value = angle;
@@ -136,7 +147,7 @@ function getGroundPointFromEvent(event: ThreeEvent<PointerEvent>): THREE.Vector3
   return hit ? point : null;
 }
 
-function updateSelectionBounds(object: THREE.Group) {
+function updateSelectionBounds(object: THREE.Group): ModelBounds {
   object.updateWorldMatrix(true, true);
 
   const parentInverse = new THREE.Matrix4();
@@ -557,67 +568,116 @@ function geometryCacheKey(model: IfcModelItem): string {
   return `${model.name}:${model.size}:${model.file.lastModified}:${model.geometryRevision}`;
 }
 
+function disposeObjectResources(object: THREE.Object3D): void {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
+
+  object.traverse((node) => {
+    const mesh = node as THREE.Mesh;
+    if (!mesh.isMesh) return;
+
+    if (mesh.geometry) geometries.add(mesh.geometry);
+    const material = mesh.material;
+    if (Array.isArray(material)) {
+      for (const item of material) materials.add(item);
+    } else if (material) {
+      materials.add(material);
+    }
+  });
+
+  for (const geometry of geometries) geometry.dispose();
+  for (const material of materials) material.dispose();
+}
+
 function RotateCornerHandle({
   xDir,
   zDir,
+  color,
+  innerRadius,
+  thickness,
   active,
   showLabel,
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  onPointerCancel,
+  onPointerOver,
+  onPointerOut,
 }: {
   xDir: 1 | -1;
   zDir: 1 | -1;
+  color: string;
+  innerRadius: number;
+  thickness: number;
   active: boolean;
   showLabel: boolean;
+  onPointerDown: (event: ThreeEvent<PointerEvent>) => void;
+  onPointerMove: (event: ThreeEvent<PointerEvent>) => void;
+  onPointerUp: (event: ThreeEvent<PointerEvent>) => void;
+  onPointerCancel: (event: ThreeEvent<PointerEvent>) => void;
+  onPointerOver: (event: ThreeEvent<PointerEvent>) => void;
+  onPointerOut: (event: ThreeEvent<PointerEvent>) => void;
 }) {
-  const arcPositions = useMemo(() => {
-    const radius = 0.58;
-    const segments = 12;
-    const values: number[] = [];
-    for (let i = 0; i <= segments; i += 1) {
-      const t = (i / segments) * (Math.PI / 2);
-      const x = xDir * radius * Math.cos(t);
-      const z = zDir * radius * Math.sin(t);
-      values.push(x, 0, z);
-    }
-    return new Float32Array(values);
-  }, [xDir, zDir]);
+  const arcGeometry = useMemo(() => {
+    const segments = 28;
+    const outerRadius = innerRadius + thickness;
+    const positions: number[] = [];
 
-  const edgePositions = useMemo(() => {
-    const edge = 0.74;
-    return new Float32Array([
-      0,
-      0,
-      0,
-      xDir * edge,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      zDir * edge,
-    ]);
-  }, [xDir, zDir]);
+    const pushPoint = (radius: number, angle: number) => {
+      positions.push(
+        xDir * radius * Math.cos(angle),
+        0,
+        zDir * radius * Math.sin(angle),
+      );
+    };
+
+    for (let index = 0; index < segments; index += 1) {
+      const start = (index / segments) * (Math.PI / 2);
+      const end = ((index + 1) / segments) * (Math.PI / 2);
+
+      pushPoint(innerRadius, start);
+      pushPoint(outerRadius, start);
+      pushPoint(outerRadius, end);
+
+      pushPoint(innerRadius, start);
+      pushPoint(outerRadius, end);
+      pushPoint(innerRadius, end);
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geometry.computeVertexNormals();
+    return geometry;
+  }, [innerRadius, thickness, xDir, zDir]);
 
   return (
     <group>
-      <lineSegments>
-        <bufferGeometry>
-          <bufferAttribute attach="attributes-position" args={[edgePositions, 3]} />
-        </bufferGeometry>
-        <lineBasicMaterial color={active ? "#ffffff" : "#94a3b8"} />
-      </lineSegments>
-
-      <line>
-        <bufferGeometry>
-          <bufferAttribute attach="attributes-position" args={[arcPositions, 3]} />
-        </bufferGeometry>
-        <lineBasicMaterial color={active ? "#ffffff" : "#94a3b8"} />
-      </line>
+      <mesh
+        geometry={arcGeometry}
+        renderOrder={18}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerCancel}
+        onPointerOver={onPointerOver}
+        onPointerOut={onPointerOut}
+      >
+        <meshBasicMaterial
+          color={color}
+          depthTest={false}
+          opacity={active ? 0.95 : 0.78}
+          side={THREE.DoubleSide}
+          transparent
+        />
+      </mesh>
 
       {showLabel && (
         <Html
-          position={[0, 0.62, 0]}
+          position={[
+            xDir * (innerRadius + thickness * 0.5) * Math.SQRT1_2,
+            0.22,
+            zDir * (innerRadius + thickness * 0.5) * Math.SQRT1_2,
+          ]}
           center
           transform={false}
           style={{ pointerEvents: "none", fontSize: "18px", lineHeight: "1.1" }}
@@ -891,11 +951,13 @@ export default function IfcViewport({
 }: Props) {
   const [progressById, setProgressById] = useState<Record<string, number>>({});
   const [cache, setCache] = useState<Map<string, CacheEntry>>(() => new Map());
+  const cacheRef = useRef(cache);
   const [isSelected, setIsSelected] = useState(false);
   const [isTransforming, setIsTransforming] = useState(false);
   const [hoveredRotateHandleKey, setHoveredRotateHandleKey] = useState<string | null>(null);
   const loadingKeysRef = useRef<Set<string>>(new Set());
   const loadingControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const progressUpdatesRef = useRef<Map<string, { at: number; value: number }>>(new Map());
 
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
   const placementGroupRef = useRef<THREE.Group | null>(null);
@@ -907,6 +969,10 @@ export default function IfcViewport({
   const instanceObjectsRef = useRef<Map<string, { geometryKey: string; object: THREE.Group }>>(
     new Map(),
   );
+
+  useEffect(() => {
+    cacheRef.current = cache;
+  }, [cache]);
 
   const activeModel = useMemo(
     () => models.find((item) => item.id === activeModelId) ?? null,
@@ -927,13 +993,13 @@ export default function IfcViewport({
     setIsSelected(Boolean(activeModelId && activeModel?.isPlaced));
   }, [activeModel?.isPlaced, activePlacement, activeModelId]);
 
-  const activeObject = useMemo(() => {
+  const activeGeometryEntry = useMemo(() => {
     if (!activeModelId || !activeModel?.isPlaced || activeModelStatus !== "ready") return null;
     const cached = cache.get(geometryCacheKey(activeModel));
-    if (!cached) return null;
-    return cached.object;
+    return cached ?? null;
   }, [activeModel, activeModelId, activeModelStatus, cache]);
 
+  const activeObject = activeGeometryEntry?.object ?? null;
 
   useEffect(() => {
     const readyModels = models.filter((item) => item.isPlaced && item.analysisStatus === "ready");
@@ -954,7 +1020,22 @@ export default function IfcViewport({
       controller.abort();
       loadingControllersRef.current.delete(key);
       loadingKeysRef.current.delete(key);
+      progressUpdatesRef.current.delete(key);
     }
+
+    setCache((previous) => {
+      let changed = false;
+      const next = new Map<string, CacheEntry>();
+      for (const [key, entry] of previous) {
+        if (validKeys.has(key)) {
+          next.set(key, entry);
+          continue;
+        }
+        disposeObjectResources(entry.object);
+        changed = true;
+      }
+      return changed ? next : previous;
+    });
 
     for (const [key, groupedModels] of groupedByGeometryKey) {
       const cacheEntry = cache.get(key);
@@ -984,6 +1065,18 @@ export default function IfcViewport({
           const result = await loadIfcGeometry(sourceModel.file, {
             signal: controller.signal,
             onProgress: (value) => {
+              const now = performance.now();
+              const lastUpdate = progressUpdatesRef.current.get(key);
+              if (
+                value < 1 &&
+                lastUpdate &&
+                now - lastUpdate.at < 80 &&
+                Math.abs(value - lastUpdate.value) < 0.02
+              ) {
+                return;
+              }
+              progressUpdatesRef.current.set(key, { at: now, value });
+
               setProgressById((previous) => {
                 let changed = false;
                 const next = { ...previous };
@@ -1004,6 +1097,7 @@ export default function IfcViewport({
             next.set(key, {
               object: result.group,
               stats: result.stats,
+              bounds: updateSelectionBounds(result.group),
             });
             return next;
           });
@@ -1020,6 +1114,7 @@ export default function IfcViewport({
         } finally {
           loadingKeysRef.current.delete(key);
           loadingControllersRef.current.delete(key);
+          progressUpdatesRef.current.delete(key);
         }
       })();
     }
@@ -1032,6 +1127,12 @@ export default function IfcViewport({
       }
       loadingControllersRef.current.clear();
       loadingKeysRef.current.clear();
+      progressUpdatesRef.current.clear();
+      for (const entry of cacheRef.current.values()) {
+        disposeObjectResources(entry.object);
+      }
+      cacheRef.current.clear();
+      instanceObjectsRef.current.clear();
     },
     [],
   );
@@ -1288,9 +1389,41 @@ export default function IfcViewport({
   );
 
   const selectionBounds = useMemo(() => {
-    if (!activeObject) return null;
-    return updateSelectionBounds(activeObject);
-  }, [activeObject]);
+    return activeGeometryEntry?.bounds ?? null;
+  }, [activeGeometryEntry]);
+
+  const selectionOutlinePositions = useMemo(() => {
+    if (!selectionBounds) return null;
+    return new Float32Array([
+      selectionBounds.minX,
+      0,
+      selectionBounds.minZ,
+      selectionBounds.maxX,
+      0,
+      selectionBounds.minZ,
+
+      selectionBounds.maxX,
+      0,
+      selectionBounds.minZ,
+      selectionBounds.maxX,
+      0,
+      selectionBounds.maxZ,
+
+      selectionBounds.maxX,
+      0,
+      selectionBounds.maxZ,
+      selectionBounds.minX,
+      0,
+      selectionBounds.maxZ,
+
+      selectionBounds.minX,
+      0,
+      selectionBounds.maxZ,
+      selectionBounds.minX,
+      0,
+      selectionBounds.minZ,
+    ]);
+  }, [selectionBounds]);
 
   const cornerHandles = useMemo(() => {
     if (!selectionBounds) return [] as Array<[number, number, number]>;
@@ -1303,13 +1436,17 @@ export default function IfcViewport({
     ];
   }, [selectionBounds]);
 
-  const rotateHandleOffset = useMemo(() => {
-    if (!selectionBounds) return 0.34;
+  const rotateHandleInnerRadius = useMemo(() => {
+    if (!selectionBounds) return 0.55;
     const width = Math.max(selectionBounds.maxX - selectionBounds.minX, 1);
     const depth = Math.max(selectionBounds.maxZ - selectionBounds.minZ, 1);
     const span = Math.max(width, depth);
-    return THREE.MathUtils.clamp(span * 0.03, 0.3, 0.9);
+    return THREE.MathUtils.clamp(span * 0.045, 0.55, 1.3);
   }, [selectionBounds]);
+
+  const rotateHandleThickness = useMemo(() => {
+    return THREE.MathUtils.clamp(rotateHandleInnerRadius * 0.32, 0.18, 0.36);
+  }, [rotateHandleInnerRadius]);
 
   const moveHandles = useMemo(() => {
     if (!selectionBounds) return [] as Array<[number, number, number]>;
@@ -1339,7 +1476,7 @@ export default function IfcViewport({
           validInstanceIds.add(item.id);
           const existing = instanceObjectsRef.current.get(item.id);
           if (existing && existing.geometryKey === geometryKey) {
-            return { model: item, object: existing.object };
+            return { model: item, object: existing.object, bounds: entry.bounds };
           }
 
           const instanceObject = entry.object.clone(true);
@@ -1347,9 +1484,14 @@ export default function IfcViewport({
             geometryKey,
             object: instanceObject,
           });
-          return { model: item, object: instanceObject };
+          return { model: item, object: instanceObject, bounds: entry.bounds };
         })
-        .filter((value): value is { model: IfcModelItem; object: THREE.Group } => Boolean(value));
+        .filter(
+          (
+            value,
+          ): value is { model: IfcModelItem; object: THREE.Group; bounds: ModelBounds } =>
+            Boolean(value),
+        );
 
       for (const [instanceId] of instanceObjectsRef.current) {
         if (validInstanceIds.has(instanceId)) continue;
@@ -1363,9 +1505,8 @@ export default function IfcViewport({
 
   const sceneGroundFootprints = useMemo(() => {
     return sceneModels
-      .map(({ model: sceneModel, object }) => {
+      .map(({ model: sceneModel, bounds }) => {
         const placement = activeModelId === sceneModel.id ? draftPlacement : sceneModel.placement;
-        const bounds = updateSelectionBounds(object);
 
         const localCorners: [GroundPoint, GroundPoint, GroundPoint, GroundPoint] = [
           { x: bounds.minX, z: bounds.minZ },
@@ -1624,7 +1765,7 @@ export default function IfcViewport({
     return null;
   }, [activeModel, activeObject, models, progressById]);
 
-  const rotateHandleColor = transformMode === "rotate" ? "#3b82f6" : "#60a5fa";
+  const rotateHandleColor = SELECTION_ACCENT_COLOR;
   const moveHandleColor = transformMode === "translate" ? "#22c55e" : "#4ade80";
 
   return (
@@ -1635,6 +1776,7 @@ export default function IfcViewport({
     >
       <Canvas
         dpr={[1, 1.5]}
+        frameloop="demand"
         camera={{ position: [15, 12, 15], fov: 45, near: 0.1, far: 20000 }}
         gl={{ antialias: true, powerPreference: "high-performance" }}
         onCreated={({ camera, gl }) => {
@@ -1683,47 +1825,16 @@ export default function IfcViewport({
                 onPointerCancel={endDrag}
               />
 
-              {isActive && isSelected && selectionBounds && (
+              {isActive && isSelected && selectionBounds && selectionOutlinePositions && (
                 <>
                   <line>
                     <bufferGeometry>
                       <bufferAttribute
                         attach="attributes-position"
-                        args={[
-                          new Float32Array([
-                            selectionBounds.minX,
-                            0,
-                            selectionBounds.minZ,
-                            selectionBounds.maxX,
-                            0,
-                            selectionBounds.minZ,
-
-                            selectionBounds.maxX,
-                            0,
-                            selectionBounds.minZ,
-                            selectionBounds.maxX,
-                            0,
-                            selectionBounds.maxZ,
-
-                            selectionBounds.maxX,
-                            0,
-                            selectionBounds.maxZ,
-                            selectionBounds.minX,
-                            0,
-                            selectionBounds.maxZ,
-
-                            selectionBounds.minX,
-                            0,
-                            selectionBounds.maxZ,
-                            selectionBounds.minX,
-                            0,
-                            selectionBounds.minZ,
-                          ]),
-                          3,
-                        ]}
+                        args={[selectionOutlinePositions, 3]}
                       />
                     </bufferGeometry>
-                    <lineBasicMaterial color="#60a5fa" linewidth={1} />
+                    <lineBasicMaterial color={SELECTION_ACCENT_COLOR} linewidth={1} />
                   </line>
 
                   {moveHandles.map((pos, index) => (
@@ -1746,36 +1857,35 @@ export default function IfcViewport({
                     const isMinZ = pos[2] <= selectionBounds.minZ + 0.0001;
                     const xDir: 1 | -1 = isMinX ? -1 : 1;
                     const zDir: 1 | -1 = isMinZ ? -1 : 1;
-                    const handleX = pos[0] + xDir * rotateHandleOffset;
-                    const handleZ = pos[2] + zDir * rotateHandleOffset;
                     return (
-                      <mesh
+                      <group
                         key={`rotate-${index}`}
-                        position={[handleX, 0.06, handleZ]}
-                        onPointerDown={beginRotateDrag}
-                        onPointerMove={handlePointerMove}
-                        onPointerUp={endDrag}
-                        onPointerCancel={endDrag}
-                        onPointerOver={(event: ThreeEvent<PointerEvent>) => {
-                          event.stopPropagation();
-                          setHoveredRotateHandleKey(handleKey);
-                        }}
-                        onPointerOut={(event: ThreeEvent<PointerEvent>) => {
-                          event.stopPropagation();
-                          setHoveredRotateHandleKey((current) =>
-                            current === handleKey ? null : current,
-                          );
-                        }}
+                        position={[pos[0], 0.08, pos[2]]}
                       >
-                      <sphereGeometry args={[0.18, 22, 22]} />
-                      <meshBasicMaterial color={rotateHandleColor} />
                         <RotateCornerHandle
                           xDir={xDir}
                           zDir={zDir}
+                          color={rotateHandleColor}
+                          innerRadius={rotateHandleInnerRadius}
+                          thickness={rotateHandleThickness}
                           active={hoveredRotateHandleKey === handleKey}
                           showLabel={hoveredRotateHandleKey === handleKey}
+                          onPointerDown={beginRotateDrag}
+                          onPointerMove={handlePointerMove}
+                          onPointerUp={endDrag}
+                          onPointerCancel={endDrag}
+                          onPointerOver={(event: ThreeEvent<PointerEvent>) => {
+                            event.stopPropagation();
+                            setHoveredRotateHandleKey(handleKey);
+                          }}
+                          onPointerOut={(event: ThreeEvent<PointerEvent>) => {
+                            event.stopPropagation();
+                            setHoveredRotateHandleKey((current) =>
+                              current === handleKey ? null : current,
+                            );
+                          }}
                         />
-                      </mesh>
+                      </group>
                     );
                   })}
                 </>

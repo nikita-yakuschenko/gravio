@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { IfcGeometryStats } from "@/types/ifc";
 import { getIfcApi } from "@/lib/ifc/getIfcApi";
 
@@ -77,6 +78,10 @@ export async function loadIfcGeometry(
   let vertices = 0;
 
   const materialCache = new Map<string, THREE.MeshStandardMaterial>();
+  const geometryBuckets = new Map<
+    string,
+    { material: THREE.MeshStandardMaterial; geometries: THREE.BufferGeometry[] }
+  >();
 
   try {
     throwIfAborted(options.signal);
@@ -139,10 +144,12 @@ export async function loadIfcGeometry(
           materialCache.set(key, material);
         }
 
-        const mesh = new THREE.Mesh(geometry, material);
-        mesh.matrixAutoUpdate = false;
-        mesh.updateMatrix();
-        group.add(mesh);
+        const bucket = geometryBuckets.get(key);
+        if (bucket) {
+          bucket.geometries.push(geometry);
+        } else {
+          geometryBuckets.set(key, { material, geometries: [geometry] });
+        }
 
         meshes += 1;
         vertices += vertexCount;
@@ -154,6 +161,33 @@ export async function loadIfcGeometry(
       safeDelete(flatMesh);
       if (total > 0) options.onProgress?.((index + 1) / total);
     });
+
+    for (const bucket of geometryBuckets.values()) {
+      const mergedGeometry =
+        bucket.geometries.length === 1
+          ? bucket.geometries[0]
+          : mergeGeometries(bucket.geometries, false);
+
+      if (mergedGeometry) {
+        if (bucket.geometries.length > 1) {
+          for (const geometry of bucket.geometries) {
+            geometry.dispose();
+          }
+        }
+        const mesh = new THREE.Mesh(mergedGeometry, bucket.material);
+        mesh.matrixAutoUpdate = false;
+        mesh.updateMatrix();
+        group.add(mesh);
+        continue;
+      }
+
+      for (const geometry of bucket.geometries) {
+        const mesh = new THREE.Mesh(geometry, bucket.material);
+        mesh.matrixAutoUpdate = false;
+        mesh.updateMatrix();
+        group.add(mesh);
+      }
+    }
 
     const placement = alignGroupToCenterGround(group);
 
