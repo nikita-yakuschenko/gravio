@@ -3,6 +3,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -15,6 +16,11 @@ import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import type { IfcModelItem } from "@/types/ifc";
 import { loadIfcGeometry } from "@/lib/ifc/loadIfcGeometry";
+import {
+  buildNanoBananaPromptJson,
+  collectPlacedModelSnapshots,
+} from "@/lib/buildNanoBananaPrompt";
+import { VIEWPORT_OUTDOOR_SPEC } from "@/lib/viewportOutdoorSpec";
 
 interface Props {
   models: IfcModelItem[];
@@ -136,6 +142,55 @@ type DragState =
     };
 
 const GROUND_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+/** Светлое «день на улице»: небо, туман, трава; без перехвата raycast (как сетка). */
+function OutdoorGroundEnvironment() {
+  const grassRef = useRef<THREE.Mesh>(null);
+  useLayoutEffect(() => {
+    const m = grassRef.current;
+    if (!m) return;
+    m.raycast = () => {};
+  }, []);
+
+  const s = VIEWPORT_OUTDOOR_SPEC;
+  return (
+    <>
+      <color attach="background" args={[s.backgroundHex]} />
+      <fog attach="fog" args={[s.fog.colorHex, s.fog.near, s.fog.far]} />
+      <hemisphereLight args={[s.hemisphere.skyHex, s.hemisphere.groundHex, s.hemisphere.intensity]} />
+      <ambientLight intensity={s.ambient.intensity} color={s.ambient.colorHex} />
+      <directionalLight
+        position={[...s.directionalWarm.position]}
+        intensity={s.directionalWarm.intensity}
+        color={s.directionalWarm.colorHex}
+      />
+      <directionalLight
+        position={[...s.directionalCool.position]}
+        intensity={s.directionalCool.intensity}
+        color={s.directionalCool.colorHex}
+      />
+      <mesh
+        ref={grassRef}
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0, s.ground.planeY, 0]}
+        frustumCulled={false}
+      >
+        <planeGeometry args={[s.ground.planeSize, s.ground.planeSize]} />
+        <meshStandardMaterial
+          color={s.ground.grassColorHex}
+          roughness={s.ground.roughness}
+          metalness={s.ground.metalness}
+          envMapIntensity={0.35}
+        />
+      </mesh>
+      <gridHelper
+        args={[s.grid.size, s.grid.divisions, s.grid.colorCenter, s.grid.colorGrid]}
+        position={[0, s.grid.y, 0]}
+      />
+    </>
+  );
+}
+
 /** Позиция камеры + target Orbit/MapControls для 2D/3D после перезагрузки. */
 const VIEWPORT_CAMERA_STORAGE_KEY = "gravio-viewport-camera-v1";
 
@@ -3192,9 +3247,71 @@ export default function IfcViewport({
 
   const rotateHandleColor = SELECTION_ACCENT_COLOR;
 
+  const [nanoBananaFeedback, setNanoBananaFeedback] = useState<string | null>(null);
+
+  const handleCopyNanoBananaPrompt = useCallback(async () => {
+    const canvas = canvasElementRef.current;
+    const cam = cameraRef.current;
+    const controls = controlsRef.current;
+    const placedModels = collectPlacedModelSnapshots(models, {
+      activeModelId,
+      draftPlacement,
+    });
+    const w = canvas?.clientWidth ?? 0;
+    const h = canvas?.clientHeight ?? 0;
+
+    if (!cam || cam.type !== "PerspectiveCamera" || !controls || !canvas) {
+      const json = buildNanoBananaPromptJson({
+        viewMode,
+        camera: null,
+        canvasCssWidth: w,
+        canvasCssHeight: h,
+        placedModels,
+        error: "Камера или canvas не готовы — подождите загрузку сцены.",
+      });
+      try {
+        await navigator.clipboard.writeText(json);
+        setNanoBananaFeedback("JSON скопирован (без параметров камеры)");
+      } catch {
+        setNanoBananaFeedback("Не удалось скопировать");
+      }
+      setTimeout(() => setNanoBananaFeedback(null), 3200);
+      return;
+    }
+
+    const p = cam as THREE.PerspectiveCamera;
+    const tgt = controls.target;
+    const cameraSnapshot = {
+      position: [p.position.x, p.position.y, p.position.z] as [number, number, number],
+      target: [tgt.x, tgt.y, tgt.z] as [number, number, number],
+      up: [p.up.x, p.up.y, p.up.z] as [number, number, number],
+      quaternion: p.quaternion.toArray() as [number, number, number, number],
+      fovDeg: THREE.MathUtils.radToDeg(p.fov),
+      aspect: p.aspect,
+      near: p.near,
+      far: p.far,
+      zoom: p.zoom,
+    };
+
+    const json = buildNanoBananaPromptJson({
+      viewMode,
+      camera: cameraSnapshot,
+      canvasCssWidth: w,
+      canvasCssHeight: h,
+      placedModels,
+    });
+    try {
+      await navigator.clipboard.writeText(json);
+      setNanoBananaFeedback("JSON для NanoBanana скопирован");
+    } catch {
+      setNanoBananaFeedback("Не удалось скопировать");
+    }
+    setTimeout(() => setNanoBananaFeedback(null), 3200);
+  }, [activeModelId, draftPlacement, models, viewMode]);
+
   return (
     <div
-      className="relative h-full w-full bg-slate-950"
+      className="relative h-full w-full bg-[#9fbfcf]"
       onDragOver={handleDragOver}
       onDrop={handleDropModel}
     >
@@ -3206,6 +3323,8 @@ export default function IfcViewport({
         onCreated={({ camera, gl }) => {
           cameraRef.current = camera;
           canvasElementRef.current = gl.domElement;
+          gl.toneMapping = THREE.ACESFilmicToneMapping;
+          gl.toneMappingExposure = VIEWPORT_OUTDOOR_SPEC.renderer.toneMappingExposure;
         }}
         onPointerMissed={() => {
           if (!dragStateRef.current) {
@@ -3214,11 +3333,7 @@ export default function IfcViewport({
           }
         }}
       >
-        <color attach="background" args={["#020617"]} />
-        <ambientLight intensity={0.65} />
-        <directionalLight position={[20, 30, 20]} intensity={1.1} />
-        <directionalLight position={[-18, 8, -12]} intensity={0.4} />
-        <gridHelper args={[200, 60, "#475569", "#1e293b"]} />
+        <OutdoorGroundEnvironment />
 
         {sceneModels.map(({ model: sceneModel, object, bounds }) => {
           const isActive = activeModelId === sceneModel.id;
@@ -3450,6 +3565,22 @@ export default function IfcViewport({
           {overlayText}
         </div>
       )}
+
+      <div className="absolute right-3 top-3 z-20 flex flex-col items-end gap-1">
+        <button
+          type="button"
+          className="pointer-events-auto rounded-lg border border-slate-600/80 bg-slate-900/85 px-3 py-1.5 text-xs font-medium text-slate-100 shadow-md backdrop-blur-sm transition-colors hover:border-cyan-500/60 hover:bg-slate-900 hover:text-white"
+          title="Скопировать детальный JSON-промпт для NanoBanana (камера 1:1, сцена, освещение)"
+          onClick={() => void handleCopyNanoBananaPrompt()}
+        >
+          NanoBanana JSON
+        </button>
+        {nanoBananaFeedback ? (
+          <span className="pointer-events-none max-w-[220px] rounded bg-slate-950/90 px-2 py-1 text-[11px] text-emerald-300 shadow">
+            {nanoBananaFeedback}
+          </span>
+        ) : null}
+      </div>
     </div>
   );
 }
