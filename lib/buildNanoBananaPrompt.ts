@@ -66,15 +66,11 @@ function buildParcelRenderNote(parcel?: NanoBananaParcelContext): string | null 
     typeof parcel.specifiedAreaM2 === "number" && Number.isFinite(parcel.specifiedAreaM2)
       ? `площадь участка ориентировочно ${Math.round(parcel.specifiedAreaM2)} м²`
       : "площадь участка не уточнена";
-  const reliefPart =
-    parcel.hasTerrain && typeof parcel.terrainElevationRangeM === "number"
-      ? `перепад рельефа около ${round6(parcel.terrainElevationRangeM)} м`
-      : "рельеф использовать мягкий и нейтральный без выдуманных экстремумов";
   const scalePart =
     typeof parcel.fitRadiusM === "number" && Number.isFinite(parcel.fitRadiusM)
       ? `масштаб сцены: радиус участка около ${round6(parcel.fitRadiusM)} м (диаметр около ${round6(parcel.fitRadiusM * 2)} м)`
       : "масштаб сцены брать строго из метрик участка в метрах";
-  return `Сцена в режиме участка: ${areaPart}, ${reliefPart}, ${scalePart}.`;
+  return `Сцена в режиме участка: ${areaPart}, ${scalePart}.`;
 }
 
 function truncatePromptText(s: string, maxChars: number): string {
@@ -353,7 +349,7 @@ export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): st
   const isParcelOnlyMode = Boolean(sanitizedParcelContext) && input.architecturalModels.length === 0;
   const parcelRenderNote = buildParcelRenderNote(sanitizedParcelContext);
   const parcelSetting = sanitizedParcelContext
-    ? "Parcel-centric pseudo-3D / isometric masterplan composition with a clearly highlighted land plot, realistic topography shaping, and restrained landscape details derived from available terrain data."
+    ? "Parcel-centric pseudo-3D / isometric masterplan composition with a clearly highlighted land plot and restrained landscape details."
     : null;
   const spec = VIEWPORT_OUTDOOR_SPEC;
   const env = {
@@ -361,7 +357,7 @@ export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): st
     narrative: {
       setting: [
         isMasterplanMode
-          ? "Masterplan visualization mode: preserve exact camera, terrain, and object placements; identical source objects must keep identical geometry while naturally reflecting viewpoint perspective."
+          ? "Masterplan visualization mode: preserve exact camera and object placements; identical source objects must keep identical geometry while naturally reflecting viewpoint perspective."
           : null,
         parcelSetting,
         "Outdoor architectural visualization, bright natural daylight, soft sky haze, lush short grass lawn, subtle green perspective grid barely visible on the ground, calm park-like atmosphere.",

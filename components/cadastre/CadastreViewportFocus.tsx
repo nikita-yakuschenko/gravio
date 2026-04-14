@@ -21,6 +21,9 @@ export function CadastreViewportFocus({
   const { camera, invalidate } = useThree();
 
   useEffect(() => {
+    // Не перетираем восстановленный из localStorage ракурс при обычной перезагрузке страницы.
+    // Автофокус нужен только после нового поиска/загрузки участка (focusGeneration > 0 в текущей сессии).
+    if (focusGeneration <= 0) return;
     const p = useParcelBaseStore.getState().parcel;
     if (!p || p.fitRadiusM <= 0) return;
 

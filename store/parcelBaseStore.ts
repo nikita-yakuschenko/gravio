@@ -17,30 +17,13 @@ export type ParcelBaseData = {
   loadedAt: number;
 };
 
-export type TerrainStatus = "idle" | "loading" | "ready" | "error";
-export type TerrainSource = "open-elevation" | "opentopodata" | "unknown" | null;
-export type TerrainProviderPref = "open-elevation" | "opentopodata";
-export type TerrainField = {
-  size: number;
-  resolution: number;
-  heights: number[]; // row-major, resolution * resolution
-};
-
 interface ParcelBaseState {
   parcel: ParcelBaseData | null;
   /** Смена ключа заставляет IfcViewport перефокусировать камеру. */
   focusGeneration: number;
-  terrainStatus: TerrainStatus;
-  terrainMessage: string | null;
-  terrainSource: TerrainSource;
-  terrainProviderPref: TerrainProviderPref;
-  terrainEnabled: boolean;
-  terrainField: TerrainField | null;
+  streetLineEdgeIndex: number | null;
   applyFeature: (feature: GeoJsonFeature) => void;
-  setTerrainStatus: (status: TerrainStatus, message?: string | null, source?: TerrainSource) => void;
-  setTerrainProviderPref: (pref: TerrainProviderPref) => void;
-  setTerrainEnabled: (enabled: boolean) => void;
-  setTerrainField: (field: TerrainField | null) => void;
+  setStreetLineEdgeIndex: (index: number | null) => void;
   clear: () => void;
 }
 
@@ -73,12 +56,7 @@ export const useParcelBaseStore = create<ParcelBaseState>()(
     (set) => ({
       parcel: null,
       focusGeneration: 0,
-      terrainStatus: "idle",
-      terrainMessage: null,
-      terrainSource: null,
-      terrainProviderPref: "opentopodata",
-      terrainEnabled: false,
-      terrainField: null,
+      streetLineEdgeIndex: null,
 
       applyFeature: (feature) => {
         if (!isPolygonGeometry(feature.geometry)) return;
@@ -99,31 +77,23 @@ export const useParcelBaseStore = create<ParcelBaseState>()(
         set((s) => ({
           parcel,
           focusGeneration: s.focusGeneration + 1,
-          terrainStatus: "loading",
-          terrainMessage: "Загружаем рельеф...",
-          terrainSource: null,
-          terrainField: null,
+          streetLineEdgeIndex: null,
         }));
       },
-
-      setTerrainStatus: (status, message = null, source = null) =>
-        set({ terrainStatus: status, terrainMessage: message, terrainSource: source }),
-      setTerrainProviderPref: (pref) => set({ terrainProviderPref: pref }),
-      setTerrainEnabled: (enabled) => set({ terrainEnabled: enabled }),
-      setTerrainField: (field) => set({ terrainField: field }),
+      setStreetLineEdgeIndex: (index) => set({ streetLineEdgeIndex: index }),
 
       clear: () =>
         set({
           parcel: null,
-          terrainStatus: "idle",
-          terrainMessage: null,
-          terrainSource: null,
-          terrainField: null,
+          streetLineEdgeIndex: null,
         }),
     }),
     {
       name: "gravio-parcel-base-v1",
-      partialize: (s) => ({ parcel: s.parcel }),
+      partialize: (s) => ({
+        parcel: s.parcel,
+        streetLineEdgeIndex: s.streetLineEdgeIndex,
+      }),
     },
   ),
 );

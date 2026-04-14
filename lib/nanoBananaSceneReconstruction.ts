@@ -58,7 +58,7 @@ export function buildNanoBananaSceneReconstructionBlock(
         "Соблюдать масштаб 1:1 в метрах: без произвольного рескейла сцены и без преувеличения вертикального рельефа.",
         "Не добавлять здания, дороги, водоёмы и иные крупные объекты, которых нет в исходных данных сцены.",
         "Не менять ориентацию камеры, перспективу и кадр относительно блока camera.",
-        "Показывать рельеф правдоподобно: только естественные склоны и микрорельеф, без искусственных террас/оврагов.",
+        "Сохранять геометрию и масштаб участка без домысливаний.",
       ],
       creative_enhancement: {
         goal: "Сделать участок визуально приятным и читаемым, не нарушая исходные геоданные.",
@@ -67,12 +67,12 @@ export function buildNanoBananaSceneReconstructionBlock(
         living_context_en:
           "Allow only restrained contextual landscaping: lawn, sparse shrubs/trees, and natural surface variation in open areas.",
         allowed_additions_ru: [
-          "Ненавязчивое озеленение без перекрытия границ участка и ключевых форм рельефа.",
-          "Лёгкая фактурность грунта и травы для читаемости микрорельефа.",
+          "Ненавязчивое озеленение без перекрытия границ участка.",
+          "Лёгкая фактурность грунта и травы.",
         ],
         allowed_additions_en: [
           "Subtle landscaping that does not obscure parcel boundary readability.",
-          "Mild ground/grass texture variation to reveal terrain form.",
+          "Mild ground/grass texture variation.",
         ],
         forbidden_ru: [
           "Не добавлять дома, хозпостройки, дороги, парковки, заборы и прочие крупные конструкции.",
@@ -86,8 +86,7 @@ export function buildNanoBananaSceneReconstructionBlock(
       narrative_guide: {
         ru: [
           "Стиль: реалистичная визуализация участка, псевдо-3D/изометрический генплан.",
-          "Акцент: границы участка и рельеф, без архитектурных доминант.",
-          "Рельеф: естественные уклоны и перепады, без драматизации.",
+          "Акцент: границы участка, без архитектурных доминант.",
           "Цвет: натуральная палитра земли/травы, аккуратная подсветка контура участка.",
           `Площадь: ${typeof parcel?.specifiedAreaM2 === "number" ? `${Math.round(parcel.specifiedAreaM2)} м²` : "нет данных"}.`,
         ].join("\n"),

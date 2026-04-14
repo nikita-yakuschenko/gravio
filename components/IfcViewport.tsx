@@ -135,11 +135,6 @@ type ViewportScale = {
   pixels: number;
 };
 
-type TerrainPatch = {
-  geometry: THREE.PlaneGeometry;
-  size: number;
-};
-
 type DragState =
   | {
       type: "move";
@@ -157,15 +152,6 @@ type DragState =
     };
 
 const GROUND_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-const TERRAIN_WORLD_Y_OFFSET = VIEWPORT_OUTDOOR_SPEC.ground.planeY + 0.012;
-const MODEL_TERRAIN_CLEARANCE_M = 0.065;
-
-function mercatorToLonLat(x: number, y: number): { lat: number; lon: number } {
-  const R = 6378137;
-  const lon = (x / R) * (180 / Math.PI);
-  const lat = (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * (180 / Math.PI);
-  return { lat, lon };
-}
 
 /** Светлое «день на улице»: небо, туман, трава; без перехвата raycast (как сетка). */
 function OutdoorGroundEnvironment() {
@@ -173,34 +159,17 @@ function OutdoorGroundEnvironment() {
   const gridRef = useRef<THREE.GridHelper>(null);
   const parcel = useParcelBaseStore((s) => s.parcel);
   const parcelRadius = parcel?.fitRadiusM ?? 0;
-  const terrainProviderPref = useParcelBaseStore((s) => s.terrainProviderPref);
-  const terrainEnabled = useParcelBaseStore((s) => s.terrainEnabled);
   const { camera, size } = useThree();
   const [gridVisual, setGridVisual] = useState<{ size: number; divisions: number }>({
     size: VIEWPORT_OUTDOOR_SPEC.grid.size,
     divisions: VIEWPORT_OUTDOOR_SPEC.grid.divisions,
   });
-  const [terrainPatch, setTerrainPatch] = useState<TerrainPatch | null>(null);
-  const setTerrainStatus = useParcelBaseStore((s) => s.setTerrainStatus);
-  const setTerrainField = useParcelBaseStore((s) => s.setTerrainField);
 
   const frameTickRef = useRef(0);
   const lastGridKeyRef = useRef("");
   const gridRayRef = useRef(new THREE.Raycaster());
   const gridLeftRef = useRef(new THREE.Vector3());
   const gridRightRef = useRef(new THREE.Vector3());
-  const terrainCacheRef = useRef<
-    Map<
-      string,
-      {
-        field: { size: number; resolution: number; heights: number[] };
-        source: "open-elevation" | "opentopodata" | "unknown";
-        rawRange: number;
-        exaggeration: number;
-        baseLift: number;
-      }
-    >
-  >(new Map());
 
   useLayoutEffect(() => {
     const m = grassRef.current;
@@ -219,247 +188,6 @@ function OutdoorGroundEnvironment() {
       mat.needsUpdate = true;
     }
   }, [gridVisual]);
-
-  useEffect(() => {
-    return () => {
-      setTerrainPatch((old) => {
-        old?.geometry.dispose();
-        return null;
-      });
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!parcel || !parcel.center3857 || parcel.fitRadiusM < 20) {
-      setTerrainPatch((old) => {
-        old?.geometry.dispose();
-        return null;
-      });
-      setTerrainField(null);
-      setTerrainStatus("idle", null, null);
-      return;
-    }
-    if (!terrainEnabled) {
-      setTerrainPatch((old) => {
-        old?.geometry.dispose();
-        return null;
-      });
-      setTerrainField(null);
-      setTerrainStatus("idle", "Режим плоскости: рельеф выключен.", null);
-      return;
-    }
-    setTerrainStatus("loading", "Запрашиваем высоты...", null);
-
-    const buildTerrain = async () => {
-      const n = 10; // 100 точек: умеренная детализация без «ломаных валов».
-      const sizeM = Math.max(parcel.fitRadiusM * 2.4, 180);
-      const half = sizeM / 2;
-      const locations: string[] = [];
-      const sampleCount = n * n;
-
-      for (let j = 0; j < n; j++) {
-        const tz = j / (n - 1);
-        const worldZ = -half + tz * sizeM;
-        for (let i = 0; i < n; i++) {
-          const tx = i / (n - 1);
-          const worldX = -half + tx * sizeM;
-          const mx = parcel.center3857.x + worldX;
-          const my = parcel.center3857.y - worldZ;
-          const { lat, lon } = mercatorToLonLat(mx, my);
-          locations.push(`${lat.toFixed(6)},${lon.toFixed(6)}`);
-        }
-      }
-
-      const cacheKey = `${parcel.loadedAt}:${terrainProviderPref}`;
-      const applyTerrainField = (
-        field: { size: number; resolution: number; heights: number[] },
-        info: {
-          source: "open-elevation" | "opentopodata" | "unknown";
-          rawRange: number;
-          exaggeration: number;
-          baseLift: number;
-        },
-        fromCache: boolean,
-      ) => {
-        const sampleCountLocal = field.resolution * field.resolution;
-        const geom = new THREE.PlaneGeometry(
-          field.size,
-          field.size,
-          field.resolution - 1,
-          field.resolution - 1,
-        );
-        geom.rotateX(-Math.PI / 2);
-        const pos = geom.attributes.position;
-        const colorAttr = new Float32Array(sampleCountLocal * 3);
-        let minY = Infinity;
-        let maxY = -Infinity;
-        for (let idx = 0; idx < sampleCountLocal; idx++) {
-          const y = field.heights[idx] ?? 0;
-          pos.setY(idx, y);
-          minY = Math.min(minY, y);
-          maxY = Math.max(maxY, y);
-        }
-        pos.needsUpdate = true;
-        const spanY = Math.max(maxY - minY, 0.0001);
-        const low = new THREE.Color("#5f7d52");
-        const high = new THREE.Color("#bcd3a4");
-        const c = new THREE.Color();
-        for (let idx = 0; idx < sampleCountLocal; idx++) {
-          const y = pos.getY(idx);
-          const t = THREE.MathUtils.clamp((y - minY) / spanY, 0, 1);
-          c.copy(low).lerp(high, t);
-          colorAttr[idx * 3] = c.r;
-          colorAttr[idx * 3 + 1] = c.g;
-          colorAttr[idx * 3 + 2] = c.b;
-        }
-        geom.setAttribute("color", new THREE.Float32BufferAttribute(colorAttr, 3));
-        geom.computeVertexNormals();
-        setTerrainPatch((old) => {
-          old?.geometry.dispose();
-          return { geometry: geom, size: field.size };
-        });
-        setTerrainField(field);
-        setTerrainStatus(
-          "ready",
-          `${fromCache ? "Рельеф из кэша" : "Рельеф"}: ${sampleCountLocal} т., перепад ~${info.rawRange.toFixed(1)} м, x${info.exaggeration.toFixed(1)}, подъём +${info.baseLift.toFixed(2)} м`,
-          info.source,
-        );
-      };
-
-      const cached = terrainCacheRef.current.get(cacheKey);
-      if (cached) {
-        if (cancelled) return;
-        applyTerrainField(cached.field, cached, true);
-        return;
-      }
-
-      try {
-        // API ограничивает размер пакета; собираем поле батчами без потери порядка.
-        const chunkSize = 100;
-        const chunks: string[][] = [];
-        for (let i = 0; i < locations.length; i += chunkSize) {
-          chunks.push(locations.slice(i, i + chunkSize));
-        }
-
-        const values: number[] = [];
-        let resolvedProvider: "open-elevation" | "opentopodata" | "unknown" = "unknown";
-        for (const chunk of chunks) {
-          const res = await fetch("/api/terrain/elevation", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ dataset: "srtm30m", locations: chunk, provider: terrainProviderPref }),
-            cache: "no-store",
-          });
-          if (!res.ok) {
-            const err = (await res.json().catch(() => ({}))) as { error?: string; detail?: string };
-            throw new Error(
-              err.detail
-                ? `${err.error ?? "OpenTopoData error"}: ${err.detail}`
-                : (err.error ?? `OpenTopoData ${res.status}`),
-            );
-          }
-          const json = (await res.json()) as {
-            provider?: string;
-            results?: Array<{ elevation: number | null }>;
-          };
-          resolvedProvider = (json.provider as "open-elevation" | "opentopodata" | undefined) ?? resolvedProvider;
-          const chunkValues = (json.results ?? []).map((r) =>
-            typeof r.elevation === "number" && Number.isFinite(r.elevation) ? r.elevation : NaN,
-          );
-          values.push(...chunkValues);
-        }
-
-        if (values.length !== sampleCount) throw new Error("Invalid elevation samples");
-        const finite = values.filter((v) => Number.isFinite(v));
-        if (finite.length < 8) throw new Error("Too few finite elevations");
-        finite.sort((a, b) => a - b);
-        const median = finite[Math.floor(finite.length / 2)]!;
-        const minElev = finite[0]!;
-        const maxElev = finite[finite.length - 1]!;
-        const rawRange = Math.max(maxElev - minElev, 0.1);
-        // Авто-экзагерация: на «плоских» участках усиливаем рельеф для читаемости.
-        const exaggeration = THREE.MathUtils.clamp(12 / rawRange, 1, 26);
-        if (cancelled) return;
-
-        const geom = new THREE.PlaneGeometry(sizeM, sizeM, n - 1, n - 1);
-        geom.rotateX(-Math.PI / 2);
-        const pos = geom.attributes.position;
-        const colorAttr = new Float32Array(sampleCount * 3);
-        const relHeights = new Array<number>(sampleCount);
-        let minY = Infinity;
-        let maxY = -Infinity;
-        for (let idx = 0; idx < sampleCount; idx++) {
-          const rel = (Number.isFinite(values[idx]!) ? values[idx]! - median : 0) * exaggeration;
-          relHeights[idx] = rel;
-          minY = Math.min(minY, rel);
-          maxY = Math.max(maxY, rel);
-        }
-        // Вся поверхность должна быть выше нулевой плоскости, иначе часть рельефа скрывается под "землей".
-        const baseLift = -Math.min(minY, 0) + 0.06;
-        minY = Infinity;
-        maxY = -Infinity;
-        for (let idx = 0; idx < sampleCount; idx++) {
-          const y = relHeights[idx]! + baseLift;
-          pos.setY(idx, y);
-          minY = Math.min(minY, y);
-          maxY = Math.max(maxY, y);
-        }
-        pos.needsUpdate = true;
-        const spanY = Math.max(maxY - minY, 0.0001);
-        const low = new THREE.Color("#5f7d52");
-        const high = new THREE.Color("#bcd3a4");
-        const c = new THREE.Color();
-        for (let idx = 0; idx < sampleCount; idx++) {
-          const y = pos.getY(idx);
-          const t = THREE.MathUtils.clamp((y - minY) / spanY, 0, 1);
-          c.copy(low).lerp(high, t);
-          colorAttr[idx * 3] = c.r;
-          colorAttr[idx * 3 + 1] = c.g;
-          colorAttr[idx * 3 + 2] = c.b;
-        }
-        geom.setAttribute("color", new THREE.Float32BufferAttribute(colorAttr, 3));
-        geom.computeVertexNormals();
-
-        const field = {
-          size: sizeM,
-          resolution: n,
-          heights: Array.from({ length: sampleCount }, (_, idx) => pos.getY(idx)),
-        };
-        terrainCacheRef.current.set(cacheKey, {
-          field,
-          source: resolvedProvider,
-          rawRange,
-          exaggeration,
-          baseLift,
-        });
-        setTerrainPatch((old) => {
-          old?.geometry.dispose();
-          return { geometry: geom, size: sizeM };
-        });
-        setTerrainField(field);
-        setTerrainStatus(
-          "ready",
-          `Рельеф: ${sampleCount} т., перепад ~${rawRange.toFixed(1)} м, x${exaggeration.toFixed(1)}, подъём +${baseLift.toFixed(2)} м`,
-          resolvedProvider,
-        );
-      } catch (e) {
-        if (cancelled) return;
-        setTerrainPatch((old) => {
-          old?.geometry.dispose();
-          return null;
-        });
-        setTerrainField(null);
-        const msg = e instanceof Error ? e.message : "OpenTopoData error";
-        setTerrainStatus("error", `Рельеф не загружен: ${msg}`, null);
-      }
-    };
-
-    void buildTerrain();
-    return () => {
-      cancelled = true;
-    };
-  }, [parcel?.loadedAt, parcel?.fitRadiusM, parcel?.center3857?.x, parcel?.center3857?.y, terrainProviderPref, terrainEnabled]);
 
   useFrame(() => {
     frameTickRef.current += 1;
@@ -508,7 +236,6 @@ function OutdoorGroundEnvironment() {
     s.ground.planeSize,
     parcelRadius * 3.2,
     gridSize * 1.12,
-    (terrainPatch?.size ?? 0) * 1.06,
   );
   const gridDivisions = gridVisual.divisions;
   return (
@@ -540,17 +267,6 @@ function OutdoorGroundEnvironment() {
           envMapIntensity={0.35}
         />
       </mesh>
-      {terrainPatch ? (
-        <mesh position={[0, s.ground.planeY + 0.012, 0]} geometry={terrainPatch.geometry} frustumCulled={false}>
-          <meshStandardMaterial
-            vertexColors
-            roughness={0.92}
-            metalness={0.02}
-            transparent={false}
-            opacity={1}
-          />
-        </mesh>
-      ) : null}
       <gridHelper
         ref={gridRef}
         args={[gridSize, gridDivisions, s.grid.colorCenter, s.grid.colorGrid]}
@@ -1371,38 +1087,6 @@ function getGroundPointFromEvent(event: ThreeEvent<PointerEvent>): THREE.Vector3
   const point = new THREE.Vector3();
   const hit = event.ray.intersectPlane(GROUND_PLANE, point);
   return hit ? point : null;
-}
-
-function sampleTerrainHeight(
-  field: { size: number; resolution: number; heights: number[] } | null,
-  x: number,
-  z: number,
-): number {
-  if (!field || field.resolution < 2 || field.heights.length < field.resolution * field.resolution) return 0;
-  const { size, resolution, heights } = field;
-  const half = size / 2;
-  const u = THREE.MathUtils.clamp((x + half) / size, 0, 1);
-  const v = THREE.MathUtils.clamp((z + half) / size, 0, 1);
-  const gx = u * (resolution - 1);
-  const gz = v * (resolution - 1);
-  const x0 = Math.floor(gx);
-  const z0 = Math.floor(gz);
-  const x1 = Math.min(x0 + 1, resolution - 1);
-  const z1 = Math.min(z0 + 1, resolution - 1);
-  const tx = gx - x0;
-  const tz = gz - z0;
-
-  const i00 = z0 * resolution + x0;
-  const i10 = z0 * resolution + x1;
-  const i01 = z1 * resolution + x0;
-  const i11 = z1 * resolution + x1;
-  const h00 = heights[i00] ?? 0;
-  const h10 = heights[i10] ?? 0;
-  const h01 = heights[i01] ?? 0;
-  const h11 = heights[i11] ?? 0;
-  const h0 = h00 * (1 - tx) + h10 * tx;
-  const h1 = h01 * (1 - tx) + h11 * tx;
-  return h0 * (1 - tz) + h1 * tz;
 }
 
 function updateSelectionBounds(object: THREE.Group): ModelBounds {
@@ -2785,6 +2469,7 @@ export default function IfcViewport({
   onSelectModel,
   onDropModel,
 }: Props) {
+  const DEBUG_MEASUREMENT_ONLY_FOOTPRINT = false;
   const [progressById, setProgressById] = useState<Record<string, number>>({});
   const [viewportScale, setViewportScale] = useState<ViewportScale | null>(null);
   const [cache, setCache] = useState<Map<string, CacheEntry>>(() => new Map());
@@ -2826,30 +2511,19 @@ export default function IfcViewport({
     () => models.find((item) => item.id === activeModelId) ?? null,
     [activeModelId, models],
   );
-  const terrainFieldForPlacement = useParcelBaseStore((s) => s.terrainField);
   const parcelForPrompt = useParcelBaseStore((s) => s.parcel);
-  const terrainSourceForPrompt = useParcelBaseStore((s) => s.terrainSource);
-  const terrainFieldForPrompt = useParcelBaseStore((s) => s.terrainField);
+  const flatPlacementMode = true;
   const activePlacement = activeModel?.placement ?? ZERO_PLACEMENT;
   const activeModelStatus = activeModel?.analysisStatus ?? "queued";
 
   const parcelContextForPrompt = useMemo(() => {
     if (!parcelForPrompt) return undefined;
-    let rangeM: number | null = null;
-    if (terrainFieldForPrompt?.heights?.length) {
-      const min = Math.min(...terrainFieldForPrompt.heights);
-      const max = Math.max(...terrainFieldForPrompt.heights);
-      rangeM = Number.isFinite(min) && Number.isFinite(max) ? Math.max(0, max - min) : null;
-    }
     return {
       cadNum: parcelForPrompt.cadNum,
       specifiedAreaM2: parcelForPrompt.specifiedAreaM2,
       fitRadiusM: parcelForPrompt.fitRadiusM,
-      hasTerrain: Boolean(terrainFieldForPrompt),
-      terrainSource: terrainSourceForPrompt,
-      terrainElevationRangeM: rangeM,
     };
-  }, [parcelForPrompt, terrainFieldForPrompt, terrainSourceForPrompt]);
+  }, [parcelForPrompt]);
 
   const [draftPlacement, setDraftPlacement] = useState<IfcModelItem["placement"]>(activePlacement);
   const draftPlacementRef = useRef(draftPlacement);
@@ -2901,34 +2575,11 @@ export default function IfcViewport({
       object: THREE.Group | null,
       bounds: ModelBounds | null,
     ): number => {
-      if (!terrainFieldForPlacement || !object || !bounds) return placement.y;
-      const probe = { ...placement, y: 0 };
-      const footprint = computeWorldFootprintFromObject(object, bounds, probe);
-      let maxTerrainY = Number.NEGATIVE_INFINITY;
-      const [c0, c1, c2, c3] = footprint.corners;
-      const center = {
-        x: (c0.x + c1.x + c2.x + c3.x) * 0.25,
-        z: (c0.z + c1.z + c2.z + c3.z) * 0.25,
-      };
-      const probes = [
-        c0,
-        c1,
-        c2,
-        c3,
-        { x: (c0.x + c1.x) * 0.5, z: (c0.z + c1.z) * 0.5 },
-        { x: (c1.x + c2.x) * 0.5, z: (c1.z + c2.z) * 0.5 },
-        { x: (c2.x + c3.x) * 0.5, z: (c2.z + c3.z) * 0.5 },
-        { x: (c3.x + c0.x) * 0.5, z: (c3.z + c0.z) * 0.5 },
-        center,
-      ];
-      for (const p of probes) {
-        maxTerrainY = Math.max(maxTerrainY, sampleTerrainHeight(terrainFieldForPlacement, p.x, p.z));
-      }
-      if (!Number.isFinite(maxTerrainY)) return placement.y;
-      const bottomOffsetY = footprint.minY;
-      return maxTerrainY + TERRAIN_WORLD_Y_OFFSET - bottomOffsetY + MODEL_TERRAIN_CLEARANCE_M;
+      void object;
+      void bounds;
+      return flatPlacementMode ? 0 : placement.y;
     },
-    [terrainFieldForPlacement],
+    [flatPlacementMode],
   );
 
   const keepPlacementAboveTerrain = useCallback(
@@ -2937,27 +2588,23 @@ export default function IfcViewport({
       object: THREE.Group | null,
       bounds: ModelBounds | null,
     ): IfcModelItem["placement"] => {
+      if (flatPlacementMode) return { ...placement, y: 0 };
       const minY = resolvePlacementY(placement, object, bounds);
       if (!Number.isFinite(minY) || placement.y >= minY) return placement;
       return { ...placement, y: minY };
     },
-    [resolvePlacementY],
+    [resolvePlacementY, flatPlacementMode],
   );
 
   useEffect(() => {
-    if (!terrainFieldForPlacement || isTransforming) return;
+    if (isTransforming) return;
     for (const model of models) {
       if (model.id === activeModelId) continue;
       if (!model.isPlaced || model.analysisStatus !== "ready") continue;
-      const entry = cache.get(geometryCacheKey(model));
-      if (!entry) continue;
-      const nextY = resolvePlacementY(model.placement, entry.object, entry.bounds);
-      if (!Number.isFinite(nextY)) continue;
-      // Автопосадка только «поднимает» объект, но не опускает ручную подстройку по Y.
-      if (model.placement.y >= nextY - 0.005) continue;
-      onPlacementCommit(model.id, { ...model.placement, y: nextY });
+      if (Math.abs(model.placement.y) <= 0.005) continue;
+      onPlacementCommit(model.id, { ...model.placement, y: 0 });
     }
-  }, [activeModelId, cache, isTransforming, models, onPlacementCommit, resolvePlacementY, terrainFieldForPlacement]);
+  }, [activeModelId, isTransforming, models, onPlacementCommit]);
 
   useEffect(() => {
     const readyModels = models.filter((item) => item.isPlaced && item.analysisStatus === "ready");
@@ -3099,7 +2746,7 @@ export default function IfcViewport({
     if (!activeModelId) return;
     const nextPlacement: IfcModelItem["placement"] = {
       x: draftPlacementRef.current.x,
-      y: draftPlacementRef.current.y,
+      y: flatPlacementMode ? 0 : draftPlacementRef.current.y,
       z: draftPlacementRef.current.z,
       rotationY: normalizeAngle(draftPlacementRef.current.rotationY),
     };
@@ -3109,7 +2756,9 @@ export default function IfcViewport({
         nextPlacement.z - activePlacement.z,
       ) > 0.01;
     // Чистая ручная коррекция по высоте (Y) не должна блокироваться автопосадкой.
-    const stabilized = movedHorizontally
+    const stabilized = flatPlacementMode
+      ? { ...nextPlacement, y: 0 }
+      : movedHorizontally
       ? keepPlacementAboveTerrain(
           nextPlacement,
           activeObject,
@@ -3119,7 +2768,7 @@ export default function IfcViewport({
     setDraftPlacement(stabilized);
     draftPlacementRef.current = stabilized;
     onPlacementCommit(activeModelId, stabilized);
-  }, [activeGeometryEntry?.bounds, activeModelId, activeObject, activePlacement.x, activePlacement.z, keepPlacementAboveTerrain, onPlacementCommit]);
+  }, [activeGeometryEntry?.bounds, activeModelId, activeObject, activePlacement.x, activePlacement.z, keepPlacementAboveTerrain, onPlacementCommit, flatPlacementMode]);
 
   const setCameraControlsEnabled = useCallback((enabled: boolean) => {
     if (controlsRef.current) controlsRef.current.enabled = enabled;
@@ -3379,7 +3028,7 @@ export default function IfcViewport({
       if (!camera || !canvasElement) {
         const fallbackPlacement: IfcModelItem["placement"] = {
           x: model.placement.x,
-          y: model.placement.y,
+          y: flatPlacementMode ? 0 : model.placement.y,
           z: model.placement.z,
           rotationY: model.placement.rotationY,
         };
@@ -3390,7 +3039,7 @@ export default function IfcViewport({
         );
         const placedModelId = onDropModel(droppedModelId, {
           x: fallbackPlacement.x,
-          y: Math.max(fallbackPlacement.y, minY),
+          y: flatPlacementMode ? 0 : Math.max(fallbackPlacement.y, minY),
           z: fallbackPlacement.z,
           rotationY: model.placement.rotationY,
         });
@@ -3412,7 +3061,7 @@ export default function IfcViewport({
       const hit = raycasterRef.current.ray.intersectPlane(GROUND_PLANE, point);
       const probePlacement: IfcModelItem["placement"] = {
         x: hit ? point.x : model.placement.x,
-        y: model.placement.y,
+        y: flatPlacementMode ? 0 : model.placement.y,
         z: hit ? point.z : model.placement.z,
         rotationY: model.placement.rotationY,
       };
@@ -3424,14 +3073,14 @@ export default function IfcViewport({
 
       const placedModelId = onDropModel(droppedModelId, {
         x: probePlacement.x,
-        y: Math.max(probePlacement.y, minY),
+        y: flatPlacementMode ? 0 : Math.max(probePlacement.y, minY),
         z: probePlacement.z,
         rotationY: model.placement.rotationY,
       });
       if (placedModelId) onSelectModel(placedModelId);
       setIsSelected(Boolean(placedModelId));
     },
-    [cache, models, onDropModel, onSelectModel, resolvePlacementY],
+    [cache, models, onDropModel, onSelectModel, resolvePlacementY, flatPlacementMode],
   );
 
   const selectionBounds = useMemo(() => {
@@ -4015,7 +3664,7 @@ export default function IfcViewport({
         }}
       >
         <OutdoorGroundEnvironment />
-        <CadastreParcelLayer />
+        <CadastreParcelLayer activeFootprintCorners={activeGroundFootprint?.corners ?? null} />
 
         {sceneModels.map(({ model: sceneModel, object, bounds }) => {
           const isActive = activeModelId === sceneModel.id;
@@ -4030,6 +3679,7 @@ export default function IfcViewport({
             >
               <primitive
                 object={object}
+                visible={!DEBUG_MEASUREMENT_ONLY_FOOTPRINT}
                 onClick={(event: ThreeEvent<MouseEvent>) => {
                   event.stopPropagation();
                   if (!isActive) onSelectModel(sceneModel.id);
