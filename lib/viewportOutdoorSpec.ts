@@ -28,8 +28,8 @@ export const VIEWPORT_OUTDOOR_SPEC = {
     size: 260,
     divisions: 52,
     /** Цвета как у GridHelper (числовой 0x…). */
-    colorCenter: 0xa3d4a0,
-    colorGrid: 0x6fa86a,
+    colorCenter: 0xf6c453,
+    colorGrid: 0xd7dee6,
     y: 0.001,
   },
   renderer: {

@@ -24,12 +24,23 @@ export type PlacedModelSnapshot = {
   };
 };
 
+export type NanoBananaParcelContext = {
+  cadNum: string | null;
+  specifiedAreaM2: number | null;
+  fitRadiusM: number | null;
+  hasTerrain: boolean;
+  terrainSource: "open-elevation" | "opentopodata" | "unknown" | null;
+  terrainElevationRangeM: number | null;
+};
+
 export type BuildNanoBananaPromptInput = {
+  promptProfile?: "parcel" | "objects" | "masterplan";
   viewMode: "2d" | "3d";
   camera: NanoBananaCameraSnapshot | null;
   canvasCssWidth: number;
   canvasCssHeight: number;
   placedModels: PlacedModelSnapshot[];
   architecturalModels: ArchitecturalModelDetail[];
+  parcelContext?: NanoBananaParcelContext;
   error?: string;
 };

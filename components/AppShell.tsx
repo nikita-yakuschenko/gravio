@@ -2,13 +2,16 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CadastreSearchPanel } from "@/components/CadastreSearchPanel";
 import { Button } from "@/components/ui/button";
 import { useIfcStore } from "@/store/ifcStore";
 import type { IfcModelItem, IfcPlacement } from "@/types/ifc";
 
 const MODEL_DND_MIME = "application/x-gravio-model-id";
 type SidebarTab = "project" | "library";
+type WorkspaceTab = "parcel" | "masterplan" | "objects";
 const ROTATION_SNAP_STEP_DEGREES = 15;
+const Y_NUDGE_STEP_METERS = 0.1;
 const VIEWPORT_DEV_MODE_STORAGE_KEY = "gravio-viewport-dev-callouts";
 
 const IfcViewport = dynamic(() => import("@/components/IfcViewport"), {
@@ -51,6 +54,7 @@ function statusTone(model: IfcModelItem): string {
 export default function AppShell() {
   const [isDragging, setIsDragging] = useState(false);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("library");
+  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>("parcel");
   const [viewMode, setViewMode] = useState<"2d" | "3d">("3d");
   const [transformMode, setTransformMode] = useState<"translate" | "rotate">("translate");
   const [rotationSnapEnabled, setRotationSnapEnabled] = useState(true);
@@ -179,27 +183,87 @@ export default function AppShell() {
       const instanceId = spawnModelInstance(id, placement);
       if (instanceId) persistModelPlacement(instanceId);
       if (instanceId) setSidebarTab("project");
+      if (instanceId) setWorkspaceTab("objects");
       return instanceId;
     },
     [persistModelPlacement, spawnModelInstance],
   );
 
+  const handleNudgeActiveModelY = useCallback(
+    (delta: number) => {
+      if (!activeModel) return;
+      const nextPlacement: IfcPlacement = {
+        ...activeModel.placement,
+        y: activeModel.placement.y + delta,
+      };
+      setModelPlacement(activeModel.id, nextPlacement);
+      persistModelPlacement(activeModel.id);
+    },
+    [activeModel, persistModelPlacement, setModelPlacement],
+  );
+
   return (
     <div className="flex h-screen flex-col bg-slate-900 text-slate-100">
-      <header className="flex h-12 items-center justify-between border-b border-slate-800 px-4">
-        <div className="flex items-center gap-3">
+      <header className="grid h-12 grid-cols-[1fr_auto_1fr] items-center border-b border-slate-800 px-4">
+        <div className="flex items-center gap-3 justify-self-start">
           <span className="text-sm font-semibold tracking-wide">gravio</span>
-          <span className="rounded border border-slate-700 bg-slate-800 px-2 py-0.5 text-xs text-slate-300">
+          <span className="rounded-md border border-slate-700 bg-slate-900/70 px-2.5 py-1 text-xs text-slate-300">
             Next 16 / React 19 / web-ifc
           </span>
         </div>
 
-        <div className="flex items-center gap-2 text-xs text-slate-400">
-          <div className="flex items-center rounded border border-slate-700 bg-slate-800 p-0.5">
+        <div
+          className="flex items-center rounded-lg border border-slate-700 bg-slate-900/70 p-0.5 shadow-inner"
+          role="tablist"
+          aria-label="Workspace mode"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={workspaceTab === "parcel"}
+            className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+              workspaceTab === "parcel"
+                ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            onClick={() => setWorkspaceTab("parcel")}
+          >
+            Участок
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={workspaceTab === "objects"}
+            className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+              workspaceTab === "objects"
+                ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            onClick={() => setWorkspaceTab("objects")}
+          >
+            Объекты
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={workspaceTab === "masterplan"}
+            className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+              workspaceTab === "masterplan"
+                ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            onClick={() => setWorkspaceTab("masterplan")}
+          >
+            Генплан
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 justify-self-end text-xs text-slate-400">
+          <div className="flex items-center rounded-lg border border-slate-700 bg-slate-900/70 p-0.5 shadow-inner">
             <button
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+              className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
                 viewMode === "2d"
-                  ? "bg-slate-600 text-slate-100"
+                  ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
                   : "text-slate-400 hover:text-slate-200"
               }`}
               onClick={() => setViewMode("2d")}
@@ -207,9 +271,9 @@ export default function AppShell() {
               2D
             </button>
             <button
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+              className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
                 viewMode === "3d"
-                  ? "bg-slate-600 text-slate-100"
+                  ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
                   : "text-slate-400 hover:text-slate-200"
               }`}
               onClick={() => setViewMode("3d")}
@@ -217,11 +281,11 @@ export default function AppShell() {
               3D
             </button>
           </div>
-          <div className="flex items-center rounded border border-slate-700 bg-slate-800 p-0.5">
+          <div className="flex items-center rounded-lg border border-slate-700 bg-slate-900/70 p-0.5 shadow-inner">
             <button
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+              className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
                 transformMode === "translate"
-                  ? "bg-slate-600 text-slate-100"
+                  ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
                   : "text-slate-400 hover:text-slate-200"
               }`}
               onClick={() => setTransformMode("translate")}
@@ -229,9 +293,9 @@ export default function AppShell() {
               Move
             </button>
             <button
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+              className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
                 transformMode === "rotate"
-                  ? "bg-slate-600 text-slate-100"
+                  ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
                   : "text-slate-400 hover:text-slate-200"
               }`}
               onClick={() => setTransformMode("rotate")}
@@ -240,10 +304,10 @@ export default function AppShell() {
             </button>
           </div>
           <button
-            className={`rounded border px-2 py-1 text-[11px] transition-colors ${
+            className={`rounded-md border px-2 py-1 text-[11px] font-medium transition-colors ${
               rotationSnapEnabled
-                ? "border-cyan-500/50 bg-cyan-500/15 text-cyan-100"
-                : "border-slate-700 bg-slate-800 text-slate-400 hover:text-slate-200"
+                ? "border-cyan-500/50 bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
+                : "border-slate-700 bg-slate-900/70 text-slate-400 hover:text-slate-200"
             }`}
             onClick={() => setRotationSnapEnabled((enabled) => !enabled)}
             title={`Snap rotation to ${ROTATION_SNAP_STEP_DEGREES} degree steps`}
@@ -251,14 +315,14 @@ export default function AppShell() {
             Snap {ROTATION_SNAP_STEP_DEGREES}°
           </button>
           <div
-            className="flex items-center rounded border border-slate-700 bg-slate-800 p-0.5"
+            className="flex items-center rounded-lg border border-slate-700 bg-slate-900/70 p-0.5 shadow-inner"
             title="Янтарные контуры следов, выноски отладки"
           >
             <button
               type="button"
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+              className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
                 !devMode
-                  ? "bg-slate-600 text-slate-100"
+                  ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
                   : "text-slate-400 hover:text-slate-200"
               }`}
               onClick={() => setDevModePersisted(false)}
@@ -267,9 +331,9 @@ export default function AppShell() {
             </button>
             <button
               type="button"
-              className={`rounded px-2 py-1 text-[11px] transition-colors ${
+              className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
                 devMode
-                  ? "bg-amber-500/20 text-amber-200 ring-1 ring-amber-500/45"
+                  ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
                   : "text-slate-400 hover:text-slate-200"
               }`}
               onClick={() => setDevModePersisted(true)}
@@ -290,42 +354,53 @@ export default function AppShell() {
       <main className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[320px_minmax(0,1fr)_320px]">
         <section className="min-h-[260px] border-b border-slate-800 md:min-h-0 md:border-b-0 md:border-r">
           <div className="flex h-full flex-col">
-            <div className="border-b border-slate-800 p-3">
-              <label
-                className={`flex min-h-28 cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed px-4 text-center transition-colors ${
-                  isDragging
-                    ? "border-cyan-400 bg-cyan-500/10 text-cyan-200"
-                    : "border-slate-600 bg-slate-800/50 text-slate-300 hover:border-slate-400"
-                }`}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  setIsDragging(true);
-                }}
-                onDragLeave={() => setIsDragging(false)}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  setIsDragging(false);
-                  onPickFiles(event.dataTransfer.files);
-                }}
-              >
-                <input
-                  className="hidden"
-                  type="file"
-                  accept=".ifc"
-                  multiple
-                  onChange={(event) => {
-                    onPickFiles(event.target.files);
-                    event.currentTarget.value = "";
+            {workspaceTab === "objects" ? (
+              <div className="border-b border-slate-800 p-3">
+                <label
+                  className={`flex min-h-28 cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed px-4 text-center transition-colors ${
+                    isDragging
+                      ? "border-cyan-400 bg-cyan-500/10 text-cyan-200"
+                      : "border-slate-600 bg-slate-800/50 text-slate-300 hover:border-slate-400"
+                  }`}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    setIsDragging(true);
                   }}
-                />
-                <span className="text-sm font-medium">Drop IFC files here</span>
-                <span className="text-xs text-slate-400">or click to browse</span>
-              </label>
-            </div>
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    setIsDragging(false);
+                    onPickFiles(event.dataTransfer.files);
+                  }}
+                >
+                  <input
+                    className="hidden"
+                    type="file"
+                    accept=".ifc"
+                    multiple
+                    onChange={(event) => {
+                      onPickFiles(event.target.files);
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                  <span className="text-sm font-medium">Drop IFC files here</span>
+                  <span className="text-xs text-slate-400">or click to browse</span>
+                </label>
+              </div>
+            ) : workspaceTab === "parcel" ? (
+              <CadastreSearchPanel />
+            ) : (
+              <div className="p-3">
+                <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-xs text-slate-400">
+                  Режим «Генплан» подготовлен. Здесь будет отдельный набор инструментов генплана.
+                </div>
+              </div>
+            )}
 
-            <div className="border-b border-slate-800 p-2">
+            {workspaceTab === "objects" ? (
+              <div className="border-b border-slate-800 p-2">
               <div
-                className="grid grid-cols-2 rounded-lg border border-slate-800 bg-slate-950/40 p-1"
+                className="grid grid-cols-2 rounded-lg border border-slate-700 bg-slate-900/70 p-0.5 shadow-inner"
                 role="tablist"
                 aria-label="Model source"
               >
@@ -335,8 +410,8 @@ export default function AppShell() {
                   aria-selected={sidebarTab === "project"}
                   className={`rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
                     sidebarTab === "project"
-                      ? "bg-slate-700 text-slate-100"
-                      : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                      ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
+                      : "text-slate-400 hover:text-slate-200"
                   }`}
                   onClick={() => setSidebarTab("project")}
                 >
@@ -349,8 +424,8 @@ export default function AppShell() {
                   aria-selected={sidebarTab === "library"}
                   className={`rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
                     sidebarTab === "library"
-                      ? "bg-slate-700 text-slate-100"
-                      : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                      ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
+                      : "text-slate-400 hover:text-slate-200"
                   }`}
                   onClick={() => setSidebarTab("library")}
                 >
@@ -358,87 +433,89 @@ export default function AppShell() {
                   <span className="ml-1 text-slate-400">({libraryModels.length})</span>
                 </button>
               </div>
-            </div>
+              </div>
+            ) : null}
 
             <div className="min-h-0 flex-1 overflow-y-auto p-2">
-              {models.length === 0 && (
+              {workspaceTab === "objects" && models.length === 0 && (
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-xs text-slate-500">
                   Add one or more `.ifc` files to start analysis and geometry extraction.
                 </div>
               )}
 
-              {models.length > 0 && sidebarModels.length === 0 && (
+              {workspaceTab === "objects" && models.length > 0 && sidebarModels.length === 0 && (
                 <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-xs text-slate-500">
                   {sidebarTab === "project"
                     ? "Перетащите модель из библиотеки на канвас, чтобы добавить ее в проект."
                     : "В библиотеке пока нет IFC-моделей."}
                 </div>
               )}
-
-              <ul className="space-y-2">
-                {sidebarModels.map((model) => {
-                  const isActive = model.id === activeModelId;
-                  const canDragToCanvas = sidebarTab === "library" && !model.isPlaced;
-                  return (
-                    <li key={model.id}>
-                      <button
-                        className={`w-full rounded-lg border p-2 text-left transition-colors ${
-                          isActive
-                            ? "border-cyan-400 bg-cyan-500/10"
-                            : "border-slate-800 bg-slate-900/60 hover:border-slate-600"
-                        }`}
-                        draggable={canDragToCanvas}
-                        onDragStart={(event) => {
-                          if (!canDragToCanvas) {
-                            event.preventDefault();
-                            return;
-                          }
-                          event.dataTransfer.effectAllowed = "move";
-                          event.dataTransfer.setData(MODEL_DND_MIME, model.id);
-                        }}
-                        onClick={() => setActiveModelId(model.id)}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-medium text-slate-100">{model.name}</p>
-                            <p className="text-xs text-slate-400">{formatBytes(model.size)}</p>
-                          </div>
-                          <span
-                            className={`rounded border px-1.5 py-0.5 text-[11px] font-medium ${statusTone(
-                              model,
-                            )}`}
-                          >
-                            {model.analysisStatus === "ready" && model.geometryStatus === "ready"
-                              ? "ready"
-                              : model.geometryStatus === "loading"
-                                ? "building"
-                                : model.analysisStatus}
-                          </span>
-                        </div>
-
-                        <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
-                          <span>{model.analysis?.schema ?? "schema: n/a"}</span>
-                          <span>
-                            {model.analysis?.entityTotal
-                              ? `${model.analysis.entityTotal.toLocaleString()} entities`
-                              : "entities: n/a"}
-                          </span>
-                          <span>{model.isPlaced ? "on canvas" : "library"}</span>
-                        </div>
-                      </button>
-
-                      <div className="mt-1 flex justify-end">
+              {workspaceTab === "objects" ? (
+                <ul className="space-y-2">
+                  {sidebarModels.map((model) => {
+                    const isActive = model.id === activeModelId;
+                    const canDragToCanvas = sidebarTab === "library" && !model.isPlaced;
+                    return (
+                      <li key={model.id}>
                         <button
-                          className="px-1 text-[11px] text-slate-500 hover:text-red-300"
-                          onClick={() => removeModel(model.id)}
+                          className={`w-full rounded-lg border p-2 text-left transition-colors ${
+                            isActive
+                              ? "border-cyan-400 bg-cyan-500/10"
+                              : "border-slate-800 bg-slate-900/60 hover:border-slate-600"
+                          }`}
+                          draggable={canDragToCanvas}
+                          onDragStart={(event) => {
+                            if (!canDragToCanvas) {
+                              event.preventDefault();
+                              return;
+                            }
+                            event.dataTransfer.effectAllowed = "move";
+                            event.dataTransfer.setData(MODEL_DND_MIME, model.id);
+                          }}
+                          onClick={() => setActiveModelId(model.id)}
                         >
-                          remove
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-medium text-slate-100">{model.name}</p>
+                              <p className="text-xs text-slate-400">{formatBytes(model.size)}</p>
+                            </div>
+                            <span
+                              className={`rounded border px-1.5 py-0.5 text-[11px] font-medium ${statusTone(
+                                model,
+                              )}`}
+                            >
+                              {model.analysisStatus === "ready" && model.geometryStatus === "ready"
+                                ? "ready"
+                                : model.geometryStatus === "loading"
+                                  ? "building"
+                                  : model.analysisStatus}
+                            </span>
+                          </div>
+
+                          <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+                            <span>{model.analysis?.schema ?? "schema: n/a"}</span>
+                            <span>
+                              {model.analysis?.entityTotal
+                                ? `${model.analysis.entityTotal.toLocaleString()} entities`
+                                : "entities: n/a"}
+                            </span>
+                            <span>{model.isPlaced ? "on canvas" : "library"}</span>
+                          </div>
                         </button>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
+
+                        <div className="mt-1 flex justify-end">
+                          <button
+                            className="px-1 text-[11px] text-slate-500 hover:text-red-300"
+                            onClick={() => removeModel(model.id)}
+                          >
+                            remove
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : null}
             </div>
           </div>
         </section>
@@ -447,6 +524,7 @@ export default function AppShell() {
           <IfcViewport
             models={models}
             activeModelId={activeModelId}
+            workspaceMode={workspaceTab}
             viewMode={viewMode}
             transformMode={transformMode}
             devMode={devMode}
@@ -520,6 +598,23 @@ export default function AppShell() {
                     <p className="text-slate-300">
                       Rotation Y: {formatCoord((activeModel.placement.rotationY * 180) / Math.PI)}°
                     </p>
+                    <div className="mt-2 flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleNudgeActiveModelY(-Y_NUDGE_STEP_METERS)}
+                      >
+                        Y -
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleNudgeActiveModelY(Y_NUDGE_STEP_METERS)}
+                      >
+                        Y +
+                      </Button>
+                      <span className="text-xs text-slate-400">Высота, шаг: {Y_NUDGE_STEP_METERS} м</span>
+                    </div>
                   </div>
 
                   <div>

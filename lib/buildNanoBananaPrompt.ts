@@ -1,9 +1,9 @@
 import type { IfcModelItem } from "@/types/ifc";
 import { VIEWPORT_OUTDOOR_SPEC } from "@/lib/viewportOutdoorSpec";
-import { buildNanoBananaSceneReconstructionBlock } from "@/lib/nanoBananaSceneReconstruction";
 import type {
   BuildNanoBananaPromptInput,
   NanoBananaCameraSnapshot,
+  NanoBananaParcelContext,
   PlacedModelSnapshot,
 } from "@/lib/nanoBananaTypes";
 
@@ -19,12 +19,67 @@ function round6(n: number): number {
   return Math.round(n * 1e6) / 1e6;
 }
 
-const TRUNC_SUFFIX = "…[усечено по лимиту]";
+function detectMasterplanLinearPattern(
+  points: Array<{ x: number; z: number }>,
+): boolean {
+  if (points.length < 3) return false;
+  const n = points.length;
+  let meanX = 0;
+  let meanZ = 0;
+  for (const p of points) {
+    meanX += p.x;
+    meanZ += p.z;
+  }
+  meanX /= n;
+  meanZ /= n;
+
+  let sxx = 0;
+  let szz = 0;
+  let sxz = 0;
+  for (const p of points) {
+    const dx = p.x - meanX;
+    const dz = p.z - meanZ;
+    sxx += dx * dx;
+    szz += dz * dz;
+    sxz += dx * dz;
+  }
+  sxx /= n;
+  szz /= n;
+  sxz /= n;
+
+  const trace = sxx + szz;
+  const det = sxx * szz - sxz * sxz;
+  const disc = Math.max(trace * trace - 4 * det, 0);
+  const sqrtDisc = Math.sqrt(disc);
+  const l1 = Math.max((trace + sqrtDisc) * 0.5, 0);
+  const l2 = Math.max((trace - sqrtDisc) * 0.5, 0);
+  if (l1 <= 1e-9) return false;
+
+  const anisotropy = l2 / l1;
+  const majorSpan = Math.sqrt(l1) * 2;
+  return anisotropy < 0.2 && majorSpan >= 12;
+}
+
+function buildParcelRenderNote(parcel?: NanoBananaParcelContext): string | null {
+  if (!parcel) return null;
+  const areaPart =
+    typeof parcel.specifiedAreaM2 === "number" && Number.isFinite(parcel.specifiedAreaM2)
+      ? `площадь участка ориентировочно ${Math.round(parcel.specifiedAreaM2)} м²`
+      : "площадь участка не уточнена";
+  const reliefPart =
+    parcel.hasTerrain && typeof parcel.terrainElevationRangeM === "number"
+      ? `перепад рельефа около ${round6(parcel.terrainElevationRangeM)} м`
+      : "рельеф использовать мягкий и нейтральный без выдуманных экстремумов";
+  const scalePart =
+    typeof parcel.fitRadiusM === "number" && Number.isFinite(parcel.fitRadiusM)
+      ? `масштаб сцены: радиус участка около ${round6(parcel.fitRadiusM)} м (диаметр около ${round6(parcel.fitRadiusM * 2)} м)`
+      : "масштаб сцены брать строго из метрик участка в метрах";
+  return `Сцена в режиме участка: ${areaPart}, ${reliefPart}, ${scalePart}.`;
+}
 
 function truncatePromptText(s: string, maxChars: number): string {
   if (s.length <= maxChars) return s;
-  const n = Math.max(0, maxChars - TRUNC_SUFFIX.length);
-  return (n > 0 ? s.slice(0, n) : "") + TRUNC_SUFFIX;
+  return s.slice(0, Math.max(0, maxChars));
 }
 
 type GravioSceneShape = {
@@ -82,6 +137,16 @@ function applyTextBudgetToPayload(payload: Record<string, unknown>, maxCharsPerF
 
 function compactJsonLength(payload: Record<string, unknown>): number {
   return JSON.stringify(payload).length;
+}
+
+/** Длина строки, если её вставляют как JSON-строку (с экранированием). */
+function escapedStringLength(s: string): number {
+  return Math.max(0, JSON.stringify(s).length - 2);
+}
+
+/** Длина при двойном экранировании (частый кейс: prompts:"<json-string>"). */
+function doubleEscapedStringLength(s: string): number {
+  return Math.max(0, JSON.stringify(JSON.stringify(s)).length - 4);
 }
 
 /**
@@ -227,8 +292,47 @@ export function finalizeNanoBananaPromptString(payload: Record<string, unknown>)
     compact = JSON.stringify(working);
   }
   const pretty = JSON.stringify(working, null, 2);
-  if (pretty.length <= MAX_NANO_BANANA_PROMPT_CHARS) return pretty;
-  return compact;
+  let out = pretty.length <= MAX_NANO_BANANA_PROMPT_CHARS ? pretty : compact;
+
+  // Внешние сервисы часто ожидают prompt как значение JSON-поля (строка с экранированием).
+  // Поэтому проверяем и этот вариант длины.
+  if (
+    escapedStringLength(out) <= MAX_NANO_BANANA_PROMPT_CHARS &&
+    doubleEscapedStringLength(out) <= MAX_NANO_BANANA_PROMPT_CHARS
+  ) {
+    return out;
+  }
+
+  // Агрессивное ужатие под экранированный лимит.
+  const factors = [0.55, 0.4, 0.28, 0.2, 0.14, 0.1, 0.07];
+  for (const factor of factors) {
+    const trial = JSON.parse(JSON.stringify(base)) as Record<string, unknown>;
+    const tighterBudget = Math.max(20, Math.floor(budget * factor));
+    applyTextBudgetToPayload(trial, tighterBudget);
+    if (compactJsonLength(trial) > MAX_NANO_BANANA_PROMPT_CHARS - RESERVED_FOR_FINAL_META) {
+      const minimized = shrinkEmergencyUntilFits(trial);
+      const minimizedCompact = JSON.stringify(minimized);
+      if (
+        escapedStringLength(minimizedCompact) <= MAX_NANO_BANANA_PROMPT_CHARS &&
+        doubleEscapedStringLength(minimizedCompact) <= MAX_NANO_BANANA_PROMPT_CHARS
+      ) {
+        return minimizedCompact;
+      }
+      out = minimizedCompact;
+      continue;
+    }
+    const trialCompact = JSON.stringify(trial);
+    if (
+      escapedStringLength(trialCompact) <= MAX_NANO_BANANA_PROMPT_CHARS &&
+      doubleEscapedStringLength(trialCompact) <= MAX_NANO_BANANA_PROMPT_CHARS
+    ) {
+      return trialCompact;
+    }
+    out = trialCompact;
+  }
+
+  // Последний fallback: возвращаем уже максимально ужатый compact.
+  return out;
 }
 
 /**
@@ -236,12 +340,34 @@ export function finalizeNanoBananaPromptString(payload: Record<string, unknown>)
  * освещение/трава как в Gravio, архитектурные данные + блок NanoBananaSceneReconstruction.
  */
 export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): string {
+  const promptProfile = input.promptProfile ?? "parcel";
+  const isMasterplanMode = promptProfile === "masterplan";
+  const sanitizedParcelContext = input.parcelContext
+    ? { ...input.parcelContext, cadNum: null }
+    : undefined;
+  const masterplanLinearPatternDetected =
+    isMasterplanMode &&
+    detectMasterplanLinearPattern(
+      input.placedModels.map((m) => ({ x: m.placement.x, z: m.placement.z })),
+    );
+  const isParcelOnlyMode = Boolean(sanitizedParcelContext) && input.architecturalModels.length === 0;
+  const parcelRenderNote = buildParcelRenderNote(sanitizedParcelContext);
+  const parcelSetting = sanitizedParcelContext
+    ? "Parcel-centric pseudo-3D / isometric masterplan composition with a clearly highlighted land plot, realistic topography shaping, and restrained landscape details derived from available terrain data."
+    : null;
   const spec = VIEWPORT_OUTDOOR_SPEC;
   const env = {
     ...spec,
     narrative: {
-      setting:
+      setting: [
+        isMasterplanMode
+          ? "Masterplan visualization mode: preserve exact camera, terrain, and object placements; identical source objects must keep identical geometry while naturally reflecting viewpoint perspective."
+          : null,
+        parcelSetting,
         "Outdoor architectural visualization, bright natural daylight, soft sky haze, lush short grass lawn, subtle green perspective grid barely visible on the ground, calm park-like atmosphere.",
+      ]
+        .filter(Boolean)
+        .join(" "),
       quality:
         "Photorealistic CGI, physically plausible lighting, soft shadows, high detail materials on buildings, crisp edges, no cartoon look, no people unless specified.",
     },
@@ -267,71 +393,130 @@ export function buildNanoBananaPromptJson(input: BuildNanoBananaPromptInput): st
             heightCssPx: Math.round(input.canvasCssHeight),
           },
           orbitControlsEquivalent: {
-            note: "Same as OrbitControls target + perspective camera position in Three.js.",
+            summary: "OrbitControls-equivalent camera state.",
           },
         }
       : {
           error: input.error ?? "Camera not ready — open the scene and wait for the view to load.",
         };
 
-  const reconstruction = {
-    summaryRu:
-      input.architecturalModels.length > 0
-        ? input.architecturalModels.map((m) => m.reconstructionPromptRu).join("\n\n")
-        : "Нет размещённых моделей с полными метаданными.",
-    summaryEn:
-      input.architecturalModels.length > 0
-        ? input.architecturalModels.map((m) => m.reconstructionPromptEn).join("\n\n")
-        : "No placed models with full metadata.",
-    perModelPrompts: input.architecturalModels.map((m) => ({
-      id: m.id,
-      ru: m.reconstructionPromptRu,
-      en: m.reconstructionPromptEn,
-    })),
-  };
+  const prototypeByKey = new Map<string, string>();
+  const prototypeList: Array<{ pid: string; size: [number, number, number] }> = [];
+  const compactObjects = input.placedModels.map((m, idx) => {
+    const detail = input.architecturalModels.find((a) => a.id === m.id);
+    const size = detail
+      ? [
+          round6(detail.localRootBounds.size.width),
+          round6(detail.localRootBounds.size.height),
+          round6(detail.localRootBounds.size.depth),
+        ]
+      : [0, 0, 0];
+    const key = size.join("|");
+    let pid = prototypeByKey.get(key);
+    if (!pid) {
+      pid = `p${prototypeList.length + 1}`;
+      prototypeByKey.set(key, pid);
+      prototypeList.push({ pid, size: size as [number, number, number] });
+    }
+    return {
+      oid: `o${idx + 1}`,
+      pid,
+      t: [
+        round6(m.placement.x),
+        round6(m.placement.y),
+        round6(m.placement.z),
+      ] as [number, number, number],
+      rY: round6(m.placement.rotationYDeg),
+    };
+  });
 
   const generation = {
     intent: "nanoBanana_image_generation",
     instructionsRu: [
-      "Сгенерируй одно изображение: фотореалистичный рендер архитектурной сцены.",
-      "Камера, кадр и перспектива должны совпадать с блоком camera / nanoBananaSceneReconstruction.camera — без сдвига и без другого угла.",
-      "Окружение: живое наружное освещение днём, лёгкая дымка на горизонте, трава на земле, небо светло-голубое, как в environment.",
-      "Архитектура: для каждого объекта в scene.architecturalModels используй численные габариты, след на земле, высоту, данные IFC (стены/окна/двери) и поля reconstructionPromptRu/en — здания должны быть визуально неотличимы по масштабу, пропорциям и характеру от эталона.",
-      "Секция nanoBananaSceneReconstruction: следуй objective, strict_requirements, narrative_guide и creative_enhancement — допускается живой антураж (деревья, участок), но без изменения дома и камеры.",
-      "Не упрощай модели до коробок: сохраняй сложность, соответствующую числу треугольников в geometryMesh.",
+      "Сгенерируй одно фотореалистичное изображение.",
+      ...(isMasterplanMode
+        ? [
+            "Режим «Генплан»: строго сохраняй позиции/повороты объектов, камеру и рельеф.",
+            "Одинаковые типовые объекты: идентичная геометрия и пропорции; отличия только из-за ракурса.",
+            "Пустые зоны между объектами заполняй реалистичным антуражем по месту.",
+            "При линейной расстановке добавляй вдоль линии дорогу: проезжая часть, тротуар, бордюр, освещение, базовая разметка, деревья.",
+          ]
+        : []),
+      ...(parcelRenderNote
+        ? [
+            "Для участка: аккуратно выдели границу, соблюдай масштаб 1:1 и реалистичный рельеф без выдумок.",
+            "Растительность только фоновая и ненавязчивая, без перекрытия ключевой геометрии.",
+            parcelRenderNote,
+          ]
+        : []),
+      "Камера/кадр/перспектива: строго как в camera.",
+      "Окружение и свет: реалистичный дневной экстерьер.",
+      ...(compactObjects.length > 0
+        ? ["Объекты: соблюдай габариты, высоты и характер объектов по данным сцены."]
+        : []),
+      "Следуй strict_requirements и narrative_guide. Без изменения фактической структуры сцены.",
+      ...(compactObjects.length > 0 ? ["Не упрощай модели до примитивов."] : []),
       "Не добавляй логотипы и водяные знаки.",
     ],
-    instructionsEn: [
-      "Generate one photorealistic architectural render.",
-      "Match the camera blocks exactly (gravio viewport + nanoBananaSceneReconstruction.camera) — identical framing.",
-      "Environment: outdoor daylight, soft atmospheric haze, grass ground, pale blue sky as in environment.",
-      "Architecture: follow scene.architecturalModels numeric data and reconstruction prompts.",
-      "Use nanoBananaSceneReconstruction (objective, strict_requirements, narrative_guide, creative_enhancement) for lived-in plot enrichment (trees, plants) without altering buildings or camera.",
-      "Do not reduce buildings to primitive boxes; preserve detail consistent with triangle counts in geometryMesh.",
-      "No logos or watermarks.",
-    ],
   };
-
-  const nanoBananaSceneReconstruction = buildNanoBananaSceneReconstructionBlock(input);
+  const objective = isMasterplanMode
+    ? "Сгенерировать точный генплан: позиции объектов/камеры/рельефа фиксированы; повторяющиеся типы объектов геометрически идентичны."
+    : isParcelOnlyMode
+      ? "Сгенерировать точную визуализацию участка: границы, рельеф, масштаб 1:1 и реалистичный контекст без выдумок."
+      : "Сгенерировать изображение, точно повторяющее текущую сцену по объектам, камере и рельефу.";
+  const strictRequirements = [
+    "Не менять позиции объектов, их ориентацию и масштаб относительно исходной сцены.",
+    "Не менять параметры камеры и композицию кадра.",
+    "Соблюдать масштаб 1:1 и реалистичный рельеф без выдуманных форм.",
+    "Не добавлять несуществующие крупные объекты.",
+    ...(isMasterplanMode
+      ? [
+          "Одинаковые типы объектов должны иметь идентичную геометрию.",
+          "При линейной расстановке объектов формировать вдоль линии улично-дорожный коридор с базовой инфраструктурой.",
+        ]
+      : []),
+  ];
+  const narrativeGuideRu = [
+    "Стиль: реалистичная архитектурная визуализация.",
+    "Фокус: точная геометрия/позиции объектов, рельеф и камера.",
+    "Контекст: естественный дневной свет и правдоподобный антураж без фантазийных элементов.",
+  ].join("\n");
 
   const payload = {
-    ...nanoBananaSceneReconstruction,
+    prompt_type: "NanoBananaSceneReconstruction",
+    version: 1,
+    objective,
+    strict_requirements: strictRequirements,
+    narrative_guide: { ru: narrativeGuideRu },
+    source_scene: {
+      mode: promptProfile,
+      objectCount: compactObjects.length,
+      prototypeCount: prototypeList.length,
+      linearPatternDetected: masterplanLinearPatternDetected,
+    },
+    camera: cameraBlock,
+    render_style: {
+      mode: "architectural visualization",
+      keep_scene_scale: true,
+      gravio_view_mode: input.viewMode,
+    },
     meta: {
       generator: "NanoBanana",
       sourceApp: "Gravio",
       schemaVersion: 3,
       exportedAt: new Date().toISOString(),
       viewMode: input.viewMode,
-      note: "Корневые поля prompt_type … render_style — шаблон сцены; блок gravio — детали вьюпорта.",
+      promptProfile,
+      masterplanLinearPatternDetected,
     },
     gravio: {
       environment: env,
       camera_detail: cameraBlock,
       scene: {
         units: "meters",
-        placedModels: input.placedModels,
-        architecturalModels: input.architecturalModels,
-        reconstruction,
+        objectPrototypes: prototypeList,
+        objects: compactObjects,
+        parcelContext: sanitizedParcelContext ?? null,
       },
       generation,
     },

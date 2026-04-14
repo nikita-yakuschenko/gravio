@@ -24,10 +24,11 @@ function quatFromTuple(q: [number, number, number, number]): { x: number; y: num
 export function buildNanoBananaSceneReconstructionBlock(
   input: BuildNanoBananaPromptInput,
 ): Record<string, unknown> {
-  const primary = input.architecturalModels[0];
-  const extras = input.architecturalModels.slice(1);
-  const firstName = primary?.name ?? input.placedModels[0]?.name ?? "IFC model";
-
+  const promptProfile = input.promptProfile ?? "parcel";
+  const isMasterplanMode = promptProfile === "masterplan";
+  const promptParcelContext = input.parcelContext
+    ? { ...input.parcelContext, cadNum: null }
+    : undefined;
   const cameraSimple =
     input.camera && !input.error
       ? {
@@ -44,6 +45,71 @@ export function buildNanoBananaSceneReconstructionBlock(
       : {
           error: input.error ?? "Camera not available",
         };
+
+  const isParcelOnlyMode = Boolean(promptParcelContext) && input.architecturalModels.length === 0;
+  if (isParcelOnlyMode) {
+    const parcel = promptParcelContext;
+    return {
+      prompt_type: "NanoBananaSceneReconstruction",
+      version: 1,
+      objective:
+        "Сгенерировать изображение участка по данным Gravio в режиме parcel-only: выразительный, но реалистичный рельеф, читаемая геометрия границ и корректный метрический масштаб без выдуманных объектов.",
+      strict_requirements: [
+        "Соблюдать масштаб 1:1 в метрах: без произвольного рескейла сцены и без преувеличения вертикального рельефа.",
+        "Не добавлять здания, дороги, водоёмы и иные крупные объекты, которых нет в исходных данных сцены.",
+        "Не менять ориентацию камеры, перспективу и кадр относительно блока camera.",
+        "Показывать рельеф правдоподобно: только естественные склоны и микрорельеф, без искусственных террас/оврагов.",
+      ],
+      creative_enhancement: {
+        goal: "Сделать участок визуально приятным и читаемым, не нарушая исходные геоданные.",
+        living_context_ru:
+          "Допустимы только мягкие фоновые элементы: газон, редкие кусты/деревья и натуральные покрытия в свободных зонах.",
+        living_context_en:
+          "Allow only restrained contextual landscaping: lawn, sparse shrubs/trees, and natural surface variation in open areas.",
+        allowed_additions_ru: [
+          "Ненавязчивое озеленение без перекрытия границ участка и ключевых форм рельефа.",
+          "Лёгкая фактурность грунта и травы для читаемости микрорельефа.",
+        ],
+        allowed_additions_en: [
+          "Subtle landscaping that does not obscure parcel boundary readability.",
+          "Mild ground/grass texture variation to reveal terrain form.",
+        ],
+        forbidden_ru: [
+          "Не добавлять дома, хозпостройки, дороги, парковки, заборы и прочие крупные конструкции.",
+          "Не менять фактическую форму участка и соотношение горизонтального/вертикального масштаба.",
+        ],
+        forbidden_en: [
+          "Do not add buildings, roads, parking areas, fences, or other major structures.",
+          "Do not alter parcel shape or horizontal/vertical scale ratio.",
+        ],
+      },
+      narrative_guide: {
+        ru: [
+          "Стиль: реалистичная визуализация участка, псевдо-3D/изометрический генплан.",
+          "Акцент: границы участка и рельеф, без архитектурных доминант.",
+          "Рельеф: естественные уклоны и перепады, без драматизации.",
+          "Цвет: натуральная палитра земли/травы, аккуратная подсветка контура участка.",
+          `Площадь: ${typeof parcel?.specifiedAreaM2 === "number" ? `${Math.round(parcel.specifiedAreaM2)} м²` : "нет данных"}.`,
+        ].join("\n"),
+      },
+      source_scene: {
+        mode: "parcel-only",
+        parcel: parcel ?? null,
+      },
+      camera: cameraSimple,
+      render_style: {
+        mode: "parcel visualization",
+        keep_original_material_balance: true,
+        keep_scene_scale: true,
+        genre: "Realistic cadastral parcel visualization with restrained landscape context",
+        gravio_view_mode: input.viewMode,
+      },
+    };
+  }
+
+  const primary = input.architecturalModels[0];
+  const extras = input.architecturalModels.slice(1);
+  const firstName = primary?.name ?? input.placedModels[0]?.name ?? "IFC model";
 
   const houseBbox = primary
     ? {
@@ -69,24 +135,17 @@ export function buildNanoBananaSceneReconstructionBlock(
     model_name: firstName,
     site_base: {
       origin: { lat: null as number | null, lng: null as number | null },
-      origin_note:
-        "В Gravio координаты участка WGS84 не задаются — при наличии данных укажите lat/lng вручную для генератора.",
       contourLocal: null as unknown,
-      contour_note: "Полигон границ участка из внешней CAD/GIS в текущем экспорте отсутствует.",
       rotationDeg: primary?.placement.rotationYDeg ?? 0,
       placementZonesLocal: [] as unknown[],
-      placementZones_note:
-        "Зоны house/bathhouse/garage и т.п. из внешних систем не хранятся в Gravio — массив пустой, можно дополнить вручную.",
     },
     site_ifc_bbox: null,
-    site_ifc_bbox_note: "Общий bbox участка IFC в приложении не экспортируется.",
     house_ifc_bbox: houseBbox,
     house_transform: primary
       ? {
           position: { x: primary.placement.x, y: primary.placement.y, z: primary.placement.z },
           rotationDeg: { x: 0, y: primary.placement.rotationYDeg, z: 0 },
           quaternion: qHouse,
-          note: "Позиция и поворот — в метрах, мир Gravio (Y-up), вокруг Y только rotationY из размещения.",
         }
       : null,
     extra_ifc: extras.map((m) => ({
@@ -96,7 +155,6 @@ export function buildNanoBananaSceneReconstructionBlock(
       local_bounds_size: m.localRootBounds.size,
       footprint_area_sq_m: m.world.footprintAreaApproxSqM,
     })),
-    extra_ifc_note: "Остальные размещённые IFC-модели на сцене (порядок не важен для кадра).",
   };
 
   const creativeEnhancement = {
@@ -165,56 +223,29 @@ export function buildNanoBananaSceneReconstructionBlock(
     "4K-class detail, HDR-ощущение, детальные материалы, точный масштаб.",
   ].join("\n");
 
-  const narrativeGuideEn = [
-    "Style and genre:",
-    "Ultra-realism, cinematic photorealism, hyperrealistic photography, architectural visualization.",
-    "",
-    "Main subject:",
-    "House(s) per IFC: exact geometry and placement on the plot; no orientation or proportion changes.",
-    "",
-    "Living atmosphere (without breaking geometry):",
-    "Real residential plot feel: trees, shrubs, natural turf and soil variation, temperate vegetation; no alien structures.",
-    "",
-    "Pose and movement:",
-    "Static scene; fixed camera; no motion blur or dynamic elements.",
-    "",
-    "Object details:",
-    "Facade and masonry at correct texture scale; windows and doors per IFC; roof and entry as in scene.",
-    "",
-    "Background and environment:",
-    "Do not invent neighboring buildings or roads; vegetation and fences only where plausible and not occluding the house.",
-    "",
-    "Lighting:",
-    "Natural daylight, soft shadows; light direction consistent with Gravio scene description.",
-    "",
-    "Color palette:",
-    "Natural facade and ground tones; neutral grays, whites, browns; realistic greens.",
-    "",
-    "Angle and framing:",
-    "Match camera composition from the camera block.",
-    "",
-    "Camera:",
-    "Position, quaternion, target, and FOV — strictly per camera field.",
-    "",
-    "Image quality:",
-    "4K-class detail, HDR-like tonal range, rich materials, accurate scale.",
-  ].join("\n");
-
   return {
     prompt_type: "NanoBananaSceneReconstruction",
     version: 1,
-    objective:
-      "Сгенерировать изображение, максимально точно повторяющее текущую сцену Gravio: те же IFC-объекты (геометрия и размещение), то же окружение по смыслу и тот же ракурс камеры; допускается обогащение участка живой растительностью в рамках creative_enhancement.",
+    objective: isMasterplanMode
+      ? "Сгенерировать генплан-сцену с высокой точностью: фиксированные позиции объектов/камеры/рельефа, идентичная геометрия повторяющихся типов и реалистичное заполнение межобъектного пространства городской/поселковой инфраструктурой."
+      : "Сгенерировать изображение, максимально точно повторяющее текущую сцену Gravio: те же IFC-объекты (геометрия и размещение), то же окружение по смыслу и тот же ракурс камеры; допускается обогащение участка живой растительностью в рамках creative_enhancement.",
     strict_requirements: [
       "Не менять геометрию, пропорции и положение зданий относительно следа на земле из данных scene.",
       "Не менять ориентацию камеры, перспективу и кадр относительно блока camera.",
+      "Соблюдать масштаб 1:1 в метрах: без произвольного рескейла сцены, без сжатия/растяжения и без преувеличения вертикального рельефа.",
       "Не добавлять посторонние здания, дороги и элементы, противоречащие сцене.",
       "Сохранить компоновку кадра; направление «света/севера» согласовать с описанием освещения Gravio.",
+      ...(isMasterplanMode
+        ? [
+            "Для одинаковых типовых объектов сохранять одинаковую геометрию и пропорции; допускается только визуальная разница из-за перспективы/ракурса.",
+            "В незаполненных зонах между объектами добавлять только правдоподобный контекст окружения по месту, без фантазийных объектов.",
+            "При линейном размещении объектов формировать вдоль линии улично-дорожный профиль: дорога, тротуары, бордюры, освещение, базовая разметка и уместное озеленение.",
+          ]
+        : []),
     ],
     creative_enhancement: creativeEnhancement,
     narrative_guide: {
       ru: narrativeGuideRu,
-      en: narrativeGuideEn,
     },
     source_scene: sourceScene,
     camera: cameraSimple,

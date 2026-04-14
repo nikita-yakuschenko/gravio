@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
-import { Billboard, Html, MapControls, OrbitControls } from "@react-three/drei";
+import { Billboard, Html, MapControls, OrbitControls, TransformControls } from "@react-three/drei";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import type { IfcModelItem } from "@/types/ifc";
@@ -22,10 +22,14 @@ import {
 } from "@/lib/buildNanoBananaPrompt";
 import { buildArchitecturalModelDetail } from "@/lib/nanoBananaArchitecturalDetail";
 import { VIEWPORT_OUTDOOR_SPEC } from "@/lib/viewportOutdoorSpec";
+import { CadastreParcelLayer } from "@/components/cadastre/CadastreParcelLayer";
+import { CadastreViewportFocus } from "@/components/cadastre/CadastreViewportFocus";
+import { useParcelBaseStore } from "@/store/parcelBaseStore";
 
 interface Props {
   models: IfcModelItem[];
   activeModelId: string | null;
+  workspaceMode?: "parcel" | "objects" | "masterplan";
   viewMode: "2d" | "3d";
   transformMode: "translate" | "rotate";
   /** Отладка: янтарные контуры следов, выноски HTML. */
@@ -126,6 +130,16 @@ interface AlignmentSnapData {
   zTargets: AlignmentSnapTarget[];
 }
 
+type ViewportScale = {
+  meters: number;
+  pixels: number;
+};
+
+type TerrainPatch = {
+  geometry: THREE.PlaneGeometry;
+  size: number;
+};
+
 type DragState =
   | {
       type: "move";
@@ -143,21 +157,252 @@ type DragState =
     };
 
 const GROUND_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const TERRAIN_WORLD_Y_OFFSET = VIEWPORT_OUTDOOR_SPEC.ground.planeY + 0.012;
+const MODEL_TERRAIN_CLEARANCE_M = 0.065;
+
+function mercatorToLonLat(x: number, y: number): { lat: number; lon: number } {
+  const R = 6378137;
+  const lon = (x / R) * (180 / Math.PI);
+  const lat = (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * (180 / Math.PI);
+  return { lat, lon };
+}
 
 /** Светлое «день на улице»: небо, туман, трава; без перехвата raycast (как сетка). */
 function OutdoorGroundEnvironment() {
   const grassRef = useRef<THREE.Mesh>(null);
+  const gridRef = useRef<THREE.GridHelper>(null);
+  const parcel = useParcelBaseStore((s) => s.parcel);
+  const parcelRadius = parcel?.fitRadiusM ?? 0;
+  const terrainProviderPref = useParcelBaseStore((s) => s.terrainProviderPref);
+  const { camera, size } = useThree();
+  const [gridVisual, setGridVisual] = useState<{ size: number; divisions: number }>({
+    size: VIEWPORT_OUTDOOR_SPEC.grid.size,
+    divisions: VIEWPORT_OUTDOOR_SPEC.grid.divisions,
+  });
+  const [terrainPatch, setTerrainPatch] = useState<TerrainPatch | null>(null);
+  const setTerrainStatus = useParcelBaseStore((s) => s.setTerrainStatus);
+  const setTerrainField = useParcelBaseStore((s) => s.setTerrainField);
+
+  const frameTickRef = useRef(0);
+  const lastGridKeyRef = useRef("");
+  const gridRayRef = useRef(new THREE.Raycaster());
+  const gridLeftRef = useRef(new THREE.Vector3());
+  const gridRightRef = useRef(new THREE.Vector3());
+
   useLayoutEffect(() => {
     const m = grassRef.current;
     if (!m) return;
     m.raycast = () => {};
   }, []);
 
+  useEffect(() => {
+    const g = gridRef.current;
+    if (!g) return;
+    const mats = Array.isArray(g.material) ? g.material : [g.material];
+    for (const mat of mats) {
+      mat.transparent = true;
+      mat.opacity = 0.42;
+      mat.depthWrite = false;
+      mat.needsUpdate = true;
+    }
+  }, [gridVisual]);
+
+  useEffect(() => {
+    return () => {
+      setTerrainPatch((old) => {
+        old?.geometry.dispose();
+        return null;
+      });
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!parcel || !parcel.center3857 || parcel.fitRadiusM < 20) {
+      setTerrainPatch((old) => {
+        old?.geometry.dispose();
+        return null;
+      });
+      setTerrainField(null);
+      setTerrainStatus("idle", null, null);
+      return;
+    }
+    setTerrainStatus("loading", "Запрашиваем высоты...", null);
+
+    const buildTerrain = async () => {
+      const n = 9; // 81 точка, укладываемся в лимит 100/запрос.
+      const sizeM = Math.max(parcel.fitRadiusM * 2.4, 180);
+      const half = sizeM / 2;
+      const locations: string[] = [];
+      const sampleCount = n * n;
+
+      for (let j = 0; j < n; j++) {
+        const tz = j / (n - 1);
+        const worldZ = -half + tz * sizeM;
+        for (let i = 0; i < n; i++) {
+          const tx = i / (n - 1);
+          const worldX = -half + tx * sizeM;
+          const mx = parcel.center3857.x + worldX;
+          const my = parcel.center3857.y - worldZ;
+          const { lat, lon } = mercatorToLonLat(mx, my);
+          locations.push(`${lat.toFixed(6)},${lon.toFixed(6)}`);
+        }
+      }
+
+      try {
+        const res = await fetch("/api/terrain/elevation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dataset: "srtm30m", locations, provider: terrainProviderPref }),
+          cache: "no-store",
+        });
+        if (!res.ok) {
+          const err = (await res.json().catch(() => ({}))) as { error?: string; detail?: string };
+          throw new Error(err.detail ? `${err.error ?? "OpenTopoData error"}: ${err.detail}` : (err.error ?? `OpenTopoData ${res.status}`));
+        }
+        const json = (await res.json()) as {
+          provider?: string;
+          results?: Array<{ elevation: number | null }>;
+        };
+        const values = (json.results ?? []).map((r) =>
+          typeof r.elevation === "number" && Number.isFinite(r.elevation) ? r.elevation : NaN,
+        );
+        if (values.length !== sampleCount) throw new Error("Invalid elevation samples");
+        const finite = values.filter((v) => Number.isFinite(v));
+        if (finite.length < 8) throw new Error("Too few finite elevations");
+        finite.sort((a, b) => a - b);
+        const median = finite[Math.floor(finite.length / 2)]!;
+        const minElev = finite[0]!;
+        const maxElev = finite[finite.length - 1]!;
+        const rawRange = Math.max(maxElev - minElev, 0.1);
+        // Авто-экзагерация: на «плоских» участках усиливаем рельеф для читаемости.
+        const exaggeration = THREE.MathUtils.clamp(12 / rawRange, 1, 26);
+        if (cancelled) return;
+
+        const geom = new THREE.PlaneGeometry(sizeM, sizeM, n - 1, n - 1);
+        geom.rotateX(-Math.PI / 2);
+        const pos = geom.attributes.position;
+        const colorAttr = new Float32Array(sampleCount * 3);
+        const relHeights = new Array<number>(sampleCount);
+        let minY = Infinity;
+        let maxY = -Infinity;
+        for (let idx = 0; idx < sampleCount; idx++) {
+          const rel = (Number.isFinite(values[idx]!) ? values[idx]! - median : 0) * exaggeration;
+          relHeights[idx] = rel;
+          minY = Math.min(minY, rel);
+          maxY = Math.max(maxY, rel);
+        }
+        // Вся поверхность должна быть выше нулевой плоскости, иначе часть рельефа скрывается под "землей".
+        const baseLift = -Math.min(minY, 0) + 0.06;
+        minY = Infinity;
+        maxY = -Infinity;
+        for (let idx = 0; idx < sampleCount; idx++) {
+          const y = relHeights[idx]! + baseLift;
+          pos.setY(idx, y);
+          minY = Math.min(minY, y);
+          maxY = Math.max(maxY, y);
+        }
+        pos.needsUpdate = true;
+        const spanY = Math.max(maxY - minY, 0.0001);
+        const low = new THREE.Color("#5f7d52");
+        const high = new THREE.Color("#bcd3a4");
+        const c = new THREE.Color();
+        for (let idx = 0; idx < sampleCount; idx++) {
+          const y = pos.getY(idx);
+          const t = THREE.MathUtils.clamp((y - minY) / spanY, 0, 1);
+          c.copy(low).lerp(high, t);
+          colorAttr[idx * 3] = c.r;
+          colorAttr[idx * 3 + 1] = c.g;
+          colorAttr[idx * 3 + 2] = c.b;
+        }
+        geom.setAttribute("color", new THREE.Float32BufferAttribute(colorAttr, 3));
+        geom.computeVertexNormals();
+
+        setTerrainPatch((old) => {
+          old?.geometry.dispose();
+          return { geometry: geom, size: sizeM };
+        });
+        setTerrainField({
+          size: sizeM,
+          resolution: n,
+          heights: Array.from({ length: sampleCount }, (_, idx) => pos.getY(idx)),
+        });
+        setTerrainStatus(
+          "ready",
+          `Рельеф: ${sampleCount} т., перепад ~${rawRange.toFixed(1)} м, x${exaggeration.toFixed(1)}, подъём +${baseLift.toFixed(2)} м`,
+          (json.provider as "open-elevation" | "opentopodata" | undefined) ?? "unknown",
+        );
+      } catch (e) {
+        if (cancelled) return;
+        setTerrainPatch((old) => {
+          old?.geometry.dispose();
+          return null;
+        });
+        setTerrainField(null);
+        const msg = e instanceof Error ? e.message : "OpenTopoData error";
+        setTerrainStatus("error", `Рельеф не загружен: ${msg}`, null);
+      }
+    };
+
+    void buildTerrain();
+    return () => {
+      cancelled = true;
+    };
+  }, [parcel?.loadedAt, parcel?.fitRadiusM, parcel?.center3857?.x, parcel?.center3857?.y, terrainProviderPref]);
+
+  useFrame(() => {
+    frameTickRef.current += 1;
+    if (frameTickRef.current % 8 !== 0) return;
+
+    const cam = camera as THREE.PerspectiveCamera;
+    const width = size.width;
+    const height = size.height;
+    if (width < 40 || height < 40) return;
+
+    // Реальный «метр на пиксель» внизу экрана: стабильно реагирует на zoom in/out.
+    const samplePx = 140;
+    const yPx = Math.max(20, height - 36);
+    const xRight = Math.max(samplePx + 30, width - 26);
+    const xLeft = xRight - samplePx;
+    const ray = gridRayRef.current;
+    const ndcL = new THREE.Vector2((xLeft / width) * 2 - 1, -(yPx / height) * 2 + 1);
+    const ndcR = new THREE.Vector2((xRight / width) * 2 - 1, -(yPx / height) * 2 + 1);
+    ray.setFromCamera(ndcL, cam);
+    const hitL = ray.ray.intersectPlane(GROUND_PLANE, gridLeftRef.current);
+    ray.setFromCamera(ndcR, cam);
+    const hitR = ray.ray.intersectPlane(GROUND_PLANE, gridRightRef.current);
+    if (!hitL || !hitR) return;
+    const metersPerPx = gridLeftRef.current.distanceTo(gridRightRef.current) / samplePx;
+    if (!Number.isFinite(metersPerPx) || metersPerPx <= 0) return;
+
+    const dist = cam.position.length();
+    const base = Math.max(VIEWPORT_OUTDOOR_SPEC.grid.size, parcelRadius * 2.6);
+    const zoomFactor = THREE.MathUtils.clamp(dist / 300, 0.65, 2.4);
+    const nextSize = Math.max(220, base * zoomFactor);
+    // При zoom out metersPerPx растет => шаг клетки крупнее => сетка реже.
+    const targetCellSize = THREE.MathUtils.clamp(metersPerPx * 42, 10, 520);
+    const nextDiv = Math.max(4, Math.min(100, Math.round(nextSize / targetCellSize)));
+    const key = `${Math.round(nextSize)}:${nextDiv}`;
+    if (lastGridKeyRef.current !== key) {
+      lastGridKeyRef.current = key;
+      setGridVisual({ size: nextSize, divisions: nextDiv });
+    }
+  });
+
   const s = VIEWPORT_OUTDOOR_SPEC;
+  // Подстраиваем окружение под крупные участки, чтобы сетка и земля оставались читаемыми.
+  const gridSize = gridVisual.size;
+  // Зеленое поле всегда шире сетки, чтобы не было «сетки за пределами поля».
+  const groundSize = Math.max(
+    s.ground.planeSize,
+    parcelRadius * 3.2,
+    gridSize * 1.12,
+    (terrainPatch?.size ?? 0) * 1.06,
+  );
+  const gridDivisions = gridVisual.divisions;
   return (
     <>
       <color attach="background" args={[s.backgroundHex]} />
-      <fog attach="fog" args={[s.fog.colorHex, s.fog.near, s.fog.far]} />
       <hemisphereLight args={[s.hemisphere.skyHex, s.hemisphere.groundHex, s.hemisphere.intensity]} />
       <ambientLight intensity={s.ambient.intensity} color={s.ambient.colorHex} />
       <directionalLight
@@ -176,7 +421,7 @@ function OutdoorGroundEnvironment() {
         position={[0, s.ground.planeY, 0]}
         frustumCulled={false}
       >
-        <planeGeometry args={[s.ground.planeSize, s.ground.planeSize]} />
+        <planeGeometry args={[groundSize, groundSize]} />
         <meshStandardMaterial
           color={s.ground.grassColorHex}
           roughness={s.ground.roughness}
@@ -184,8 +429,23 @@ function OutdoorGroundEnvironment() {
           envMapIntensity={0.35}
         />
       </mesh>
+      {terrainPatch ? (
+        <mesh position={[0, s.ground.planeY + 0.012, 0]} geometry={terrainPatch.geometry} frustumCulled={false}>
+          <meshStandardMaterial
+            vertexColors
+            roughness={0.92}
+            metalness={0.02}
+            transparent
+            opacity={0.96}
+            polygonOffset
+            polygonOffsetFactor={1}
+            polygonOffsetUnits={1}
+          />
+        </mesh>
+      ) : null}
       <gridHelper
-        args={[s.grid.size, s.grid.divisions, s.grid.colorCenter, s.grid.colorGrid]}
+        ref={gridRef}
+        args={[gridSize, gridDivisions, s.grid.colorCenter, s.grid.colorGrid]}
         position={[0, s.grid.y, 0]}
       />
     </>
@@ -236,6 +496,80 @@ function persistViewportCamera(
   } catch {
     /* ignore quota / private mode */
   }
+}
+
+function pickNiceDistance(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  const power = Math.pow(10, Math.floor(Math.log10(value)));
+  const n = value / power;
+  if (n < 1.5) return 1 * power;
+  if (n < 3.5) return 2 * power;
+  if (n < 7.5) return 5 * power;
+  return 10 * power;
+}
+
+function formatScaleDistance(meters: number): string {
+  if (meters >= 1000) {
+    const km = meters / 1000;
+    return `${km.toFixed(km >= 10 ? 0 : 1)} км`;
+  }
+  return `${Math.round(meters)} м`;
+}
+
+function ViewportScaleProbe({
+  onScaleChange,
+}: {
+  onScaleChange: (scale: ViewportScale | null) => void;
+}) {
+  const { camera, size } = useThree();
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const leftRef = useRef(new THREE.Vector3());
+  const rightRef = useRef(new THREE.Vector3());
+  const lastKeyRef = useRef<string>("");
+  const frameCountRef = useRef(0);
+
+  useFrame(() => {
+    frameCountRef.current += 1;
+    if (frameCountRef.current % 4 !== 0) return;
+    const width = size.width;
+    const height = size.height;
+    if (width < 40 || height < 40) return;
+
+    const samplePx = 120;
+    const marginRight = 28;
+    const yPx = Math.max(20, height - 34);
+    const xRight = Math.max(marginRight + samplePx + 4, width - marginRight);
+    const xLeft = xRight - samplePx;
+
+    const ray = raycasterRef.current;
+    const ndcL = new THREE.Vector2((xLeft / width) * 2 - 1, -(yPx / height) * 2 + 1);
+    const ndcR = new THREE.Vector2((xRight / width) * 2 - 1, -(yPx / height) * 2 + 1);
+    ray.setFromCamera(ndcL, camera);
+    const hitL = ray.ray.intersectPlane(GROUND_PLANE, leftRef.current);
+    ray.setFromCamera(ndcR, camera);
+    const hitR = ray.ray.intersectPlane(GROUND_PLANE, rightRef.current);
+    if (!hitL || !hitR) {
+      if (lastKeyRef.current !== "none") {
+        lastKeyRef.current = "none";
+        onScaleChange(null);
+      }
+      return;
+    }
+
+    const worldDist = leftRef.current.distanceTo(rightRef.current);
+    if (!Number.isFinite(worldDist) || worldDist <= 0.0001) return;
+    const niceMeters = pickNiceDistance(worldDist);
+    if (niceMeters <= 0) return;
+    const pixels = (samplePx * niceMeters) / worldDist;
+    const boundedPixels = Math.max(40, Math.min(180, pixels));
+    const key = `${Math.round(niceMeters)}:${Math.round(boundedPixels)}`;
+    if (lastKeyRef.current !== key) {
+      lastKeyRef.current = key;
+      onScaleChange({ meters: niceMeters, pixels: boundedPixels });
+    }
+  });
+
+  return null;
 }
 
 const MODEL_DND_MIME = "application/x-gravio-model-id";
@@ -929,6 +1263,38 @@ function getGroundPointFromEvent(event: ThreeEvent<PointerEvent>): THREE.Vector3
   const point = new THREE.Vector3();
   const hit = event.ray.intersectPlane(GROUND_PLANE, point);
   return hit ? point : null;
+}
+
+function sampleTerrainHeight(
+  field: { size: number; resolution: number; heights: number[] } | null,
+  x: number,
+  z: number,
+): number {
+  if (!field || field.resolution < 2 || field.heights.length < field.resolution * field.resolution) return 0;
+  const { size, resolution, heights } = field;
+  const half = size / 2;
+  const u = THREE.MathUtils.clamp((x + half) / size, 0, 1);
+  const v = THREE.MathUtils.clamp((z + half) / size, 0, 1);
+  const gx = u * (resolution - 1);
+  const gz = v * (resolution - 1);
+  const x0 = Math.floor(gx);
+  const z0 = Math.floor(gz);
+  const x1 = Math.min(x0 + 1, resolution - 1);
+  const z1 = Math.min(z0 + 1, resolution - 1);
+  const tx = gx - x0;
+  const tz = gz - z0;
+
+  const i00 = z0 * resolution + x0;
+  const i10 = z0 * resolution + x1;
+  const i01 = z1 * resolution + x0;
+  const i11 = z1 * resolution + x1;
+  const h00 = heights[i00] ?? 0;
+  const h10 = heights[i10] ?? 0;
+  const h01 = heights[i01] ?? 0;
+  const h11 = heights[i11] ?? 0;
+  const h0 = h00 * (1 - tx) + h10 * tx;
+  const h1 = h01 * (1 - tx) + h11 * tx;
+  return h0 * (1 - tz) + h1 * tz;
 }
 
 function updateSelectionBounds(object: THREE.Group): ModelBounds {
@@ -2298,6 +2664,7 @@ function CameraController({
 export default function IfcViewport({
   models,
   activeModelId,
+  workspaceMode = "parcel",
   viewMode,
   transformMode,
   devMode,
@@ -2311,6 +2678,7 @@ export default function IfcViewport({
   onDropModel,
 }: Props) {
   const [progressById, setProgressById] = useState<Record<string, number>>({});
+  const [viewportScale, setViewportScale] = useState<ViewportScale | null>(null);
   const [cache, setCache] = useState<Map<string, CacheEntry>>(() => new Map());
   const cacheRef = useRef(cache);
   const [isSelected, setIsSelected] = useState(false);
@@ -2350,8 +2718,30 @@ export default function IfcViewport({
     () => models.find((item) => item.id === activeModelId) ?? null,
     [activeModelId, models],
   );
+  const terrainFieldForPlacement = useParcelBaseStore((s) => s.terrainField);
+  const parcelForPrompt = useParcelBaseStore((s) => s.parcel);
+  const terrainSourceForPrompt = useParcelBaseStore((s) => s.terrainSource);
+  const terrainFieldForPrompt = useParcelBaseStore((s) => s.terrainField);
   const activePlacement = activeModel?.placement ?? ZERO_PLACEMENT;
   const activeModelStatus = activeModel?.analysisStatus ?? "queued";
+
+  const parcelContextForPrompt = useMemo(() => {
+    if (!parcelForPrompt) return undefined;
+    let rangeM: number | null = null;
+    if (terrainFieldForPrompt?.heights?.length) {
+      const min = Math.min(...terrainFieldForPrompt.heights);
+      const max = Math.max(...terrainFieldForPrompt.heights);
+      rangeM = Number.isFinite(min) && Number.isFinite(max) ? Math.max(0, max - min) : null;
+    }
+    return {
+      cadNum: parcelForPrompt.cadNum,
+      specifiedAreaM2: parcelForPrompt.specifiedAreaM2,
+      fitRadiusM: parcelForPrompt.fitRadiusM,
+      hasTerrain: Boolean(terrainFieldForPrompt),
+      terrainSource: terrainSourceForPrompt,
+      terrainElevationRangeM: rangeM,
+    };
+  }, [parcelForPrompt, terrainFieldForPrompt, terrainSourceForPrompt]);
 
   const [draftPlacement, setDraftPlacement] = useState<IfcModelItem["placement"]>(activePlacement);
   const draftPlacementRef = useRef(draftPlacement);
@@ -2396,6 +2786,69 @@ export default function IfcViewport({
   }, [activeModel, activeModelId, activeModelStatus, cache]);
 
   const activeObject = activeGeometryEntry?.object ?? null;
+
+  const resolvePlacementY = useCallback(
+    (
+      placement: IfcModelItem["placement"],
+      object: THREE.Group | null,
+      bounds: ModelBounds | null,
+    ): number => {
+      if (!terrainFieldForPlacement || !object || !bounds) return placement.y;
+      const probe = { ...placement, y: 0 };
+      const footprint = computeWorldFootprintFromObject(object, bounds, probe);
+      let maxTerrainY = Number.NEGATIVE_INFINITY;
+      const [c0, c1, c2, c3] = footprint.corners;
+      const center = {
+        x: (c0.x + c1.x + c2.x + c3.x) * 0.25,
+        z: (c0.z + c1.z + c2.z + c3.z) * 0.25,
+      };
+      const probes = [
+        c0,
+        c1,
+        c2,
+        c3,
+        { x: (c0.x + c1.x) * 0.5, z: (c0.z + c1.z) * 0.5 },
+        { x: (c1.x + c2.x) * 0.5, z: (c1.z + c2.z) * 0.5 },
+        { x: (c2.x + c3.x) * 0.5, z: (c2.z + c3.z) * 0.5 },
+        { x: (c3.x + c0.x) * 0.5, z: (c3.z + c0.z) * 0.5 },
+        center,
+      ];
+      for (const p of probes) {
+        maxTerrainY = Math.max(maxTerrainY, sampleTerrainHeight(terrainFieldForPlacement, p.x, p.z));
+      }
+      if (!Number.isFinite(maxTerrainY)) return placement.y;
+      const bottomOffsetY = footprint.minY;
+      return maxTerrainY + TERRAIN_WORLD_Y_OFFSET - bottomOffsetY + MODEL_TERRAIN_CLEARANCE_M;
+    },
+    [terrainFieldForPlacement],
+  );
+
+  const keepPlacementAboveTerrain = useCallback(
+    (
+      placement: IfcModelItem["placement"],
+      object: THREE.Group | null,
+      bounds: ModelBounds | null,
+    ): IfcModelItem["placement"] => {
+      const minY = resolvePlacementY(placement, object, bounds);
+      if (!Number.isFinite(minY) || placement.y >= minY) return placement;
+      return { ...placement, y: minY };
+    },
+    [resolvePlacementY],
+  );
+
+  useEffect(() => {
+    if (!terrainFieldForPlacement || isTransforming) return;
+    for (const model of models) {
+      if (!model.isPlaced || model.analysisStatus !== "ready") continue;
+      const entry = cache.get(geometryCacheKey(model));
+      if (!entry) continue;
+      const nextY = resolvePlacementY(model.placement, entry.object, entry.bounds);
+      if (!Number.isFinite(nextY)) continue;
+      // Автопосадка только «поднимает» объект, но не опускает ручную подстройку по Y.
+      if (model.placement.y >= nextY - 0.005) continue;
+      onPlacementCommit(model.id, { ...model.placement, y: nextY });
+    }
+  }, [cache, isTransforming, models, onPlacementCommit, resolvePlacementY, terrainFieldForPlacement]);
 
   useEffect(() => {
     const readyModels = models.filter((item) => item.isPlaced && item.analysisStatus === "ready");
@@ -2535,15 +2988,21 @@ export default function IfcViewport({
 
   const commitPlacement = useCallback(() => {
     if (!activeModelId) return;
-    const nextPlacement = {
+    const nextPlacement: IfcModelItem["placement"] = {
       x: draftPlacementRef.current.x,
-      y: 0,
+      y: draftPlacementRef.current.y,
       z: draftPlacementRef.current.z,
       rotationY: normalizeAngle(draftPlacementRef.current.rotationY),
     };
-    setDraftPlacement(nextPlacement);
-    onPlacementCommit(activeModelId, nextPlacement);
-  }, [activeModelId, onPlacementCommit]);
+    const stabilized = keepPlacementAboveTerrain(
+      nextPlacement,
+      activeObject,
+      activeGeometryEntry?.bounds ?? null,
+    );
+    setDraftPlacement(stabilized);
+    draftPlacementRef.current = stabilized;
+    onPlacementCommit(activeModelId, stabilized);
+  }, [activeGeometryEntry?.bounds, activeModelId, activeObject, keepPlacementAboveTerrain, onPlacementCommit]);
 
   const setCameraControlsEnabled = useCallback((enabled: boolean) => {
     if (controlsRef.current) controlsRef.current.enabled = enabled;
@@ -2719,10 +3178,11 @@ export default function IfcViewport({
         let next = applyAlignmentSnap({
           ...previous,
           x: previous.x + nextDx,
-          y: 0,
+          y: previous.y,
           z: previous.z + nextDz,
         });
         next = applyParallelFaceMagnetToPlacement(next);
+        next = keepPlacementAboveTerrain(next, activeObject, activeGeometryEntry?.bounds ?? null);
         return next;
       });
     } else {
@@ -2747,6 +3207,7 @@ export default function IfcViewport({
         if (activeModelId) {
           next = applyParallelEdgeRotationSnap(next, activeModelId, sceneModelsRef.current);
         }
+        next = keepPlacementAboveTerrain(next, activeObject, activeGeometryEntry?.bounds ?? null);
         return next;
       });
     }
@@ -2754,6 +3215,9 @@ export default function IfcViewport({
     activeModelId,
     applyAlignmentSnap,
     applyParallelFaceMagnetToPlacement,
+    activeGeometryEntry?.bounds,
+    activeObject,
+    keepPlacementAboveTerrain,
     rotationSnapEnabled,
     rotationSnapStepDegrees,
   ]);
@@ -2794,11 +3258,23 @@ export default function IfcViewport({
 
       const camera = cameraRef.current;
       const canvasElement = canvasElementRef.current;
+      const cacheEntry = cache.get(geometryCacheKey(model));
       if (!camera || !canvasElement) {
-        const placedModelId = onDropModel(droppedModelId, {
+        const fallbackPlacement: IfcModelItem["placement"] = {
           x: model.placement.x,
-          y: 0,
+          y: model.placement.y,
           z: model.placement.z,
+          rotationY: model.placement.rotationY,
+        };
+        const minY = resolvePlacementY(
+          fallbackPlacement,
+          cacheEntry?.object ?? null,
+          cacheEntry?.bounds ?? null,
+        );
+        const placedModelId = onDropModel(droppedModelId, {
+          x: fallbackPlacement.x,
+          y: Math.max(fallbackPlacement.y, minY),
+          z: fallbackPlacement.z,
           rotationY: model.placement.rotationY,
         });
         if (placedModelId) onSelectModel(placedModelId);
@@ -2817,17 +3293,28 @@ export default function IfcViewport({
 
       const point = new THREE.Vector3();
       const hit = raycasterRef.current.ray.intersectPlane(GROUND_PLANE, point);
+      const probePlacement: IfcModelItem["placement"] = {
+        x: hit ? point.x : model.placement.x,
+        y: model.placement.y,
+        z: hit ? point.z : model.placement.z,
+        rotationY: model.placement.rotationY,
+      };
+      const minY = resolvePlacementY(
+        probePlacement,
+        cacheEntry?.object ?? null,
+        cacheEntry?.bounds ?? null,
+      );
 
       const placedModelId = onDropModel(droppedModelId, {
-        x: hit ? point.x : model.placement.x,
-        y: 0,
-        z: hit ? point.z : model.placement.z,
+        x: probePlacement.x,
+        y: Math.max(probePlacement.y, minY),
+        z: probePlacement.z,
         rotationY: model.placement.rotationY,
       });
       if (placedModelId) onSelectModel(placedModelId);
       setIsSelected(Boolean(placedModelId));
     },
-    [models, onDropModel, onSelectModel],
+    [cache, models, onDropModel, onSelectModel, resolvePlacementY],
   );
 
   const selectionBounds = useMemo(() => {
@@ -3281,12 +3768,14 @@ export default function IfcViewport({
 
     if (!cam || cam.type !== "PerspectiveCamera" || !controls || !canvas) {
       const json = buildNanoBananaPromptJson({
+        promptProfile: workspaceMode,
         viewMode,
         camera: null,
         canvasCssWidth: w,
         canvasCssHeight: h,
         placedModels,
         architecturalModels: nanoBananaArchitecturalModels,
+        parcelContext: parcelContextForPrompt,
         error: "Камера или canvas не готовы — подождите загрузку сцены.",
       });
       try {
@@ -3314,12 +3803,14 @@ export default function IfcViewport({
     };
 
     const json = buildNanoBananaPromptJson({
+      promptProfile: workspaceMode,
       viewMode,
       camera: cameraSnapshot,
       canvasCssWidth: w,
       canvasCssHeight: h,
       placedModels,
       architecturalModels: nanoBananaArchitecturalModels,
+      parcelContext: parcelContextForPrompt,
     });
     try {
       await navigator.clipboard.writeText(json);
@@ -3328,7 +3819,7 @@ export default function IfcViewport({
       setNanoBananaFeedback("Не удалось скопировать");
     }
     setTimeout(() => setNanoBananaFeedback(null), 3200);
-  }, [activeModelId, draftPlacement, models, nanoBananaArchitecturalModels, viewMode]);
+  }, [activeModelId, draftPlacement, models, nanoBananaArchitecturalModels, parcelContextForPrompt, viewMode, workspaceMode]);
 
   const handleCopyViewportSnapshot = useCallback(async () => {
     const gl = glRef.current;
@@ -3407,6 +3898,7 @@ export default function IfcViewport({
         }}
       >
         <OutdoorGroundEnvironment />
+        <CadastreParcelLayer />
 
         {sceneModels.map(({ model: sceneModel, object, bounds }) => {
           const isActive = activeModelId === sceneModel.id;
@@ -3433,7 +3925,8 @@ export default function IfcViewport({
                     setIsSelected(true);
                     return;
                   }
-                  if (transformMode === "translate") beginMoveDrag(event);
+                  // В режиме translate используем 3-осевой TransformControls во вьюпорте.
+                  if (transformMode !== "translate") beginMoveDrag(event);
                 }}
                 onPointerOver={(event: ThreeEvent<PointerEvent>) => {
                   if (!isActive || transformMode !== "translate") return;
@@ -3523,6 +4016,45 @@ export default function IfcViewport({
             </group>
           );
         })}
+
+        {transformMode === "translate" &&
+        isSelected &&
+        activeModelId &&
+        placementGroupRef.current ? (
+          <TransformControls
+            object={placementGroupRef.current}
+            mode="translate"
+            size={0.9}
+            showX
+            showY
+            showZ
+            onObjectChange={() => {
+              const g = placementGroupRef.current;
+              if (!g) return;
+              const nextPlacement = {
+                x: g.position.x,
+                y: g.position.y,
+                z: g.position.z,
+                rotationY: normalizeAngle(g.rotation.y),
+              };
+              // Важно обновить ref синхронно: commitPlacement читает именно его.
+              draftPlacementRef.current = nextPlacement;
+              setDraftPlacement((prev) => ({
+                ...prev,
+                ...nextPlacement,
+              }));
+            }}
+            onMouseDown={() => {
+              setIsTransforming(true);
+              setCameraControlsEnabled(false);
+            }}
+            onMouseUp={() => {
+              setIsTransforming(false);
+              setCameraControlsEnabled(true);
+              commitPlacement();
+            }}
+          />
+        ) : null}
 
         {proximityHatchAreas.map((area) => (
           <ProximityHatchOverlay
@@ -3631,6 +4163,8 @@ export default function IfcViewport({
           viewMode={viewMode}
           controlsRef={controlsRef}
         />
+        <ViewportScaleProbe onScaleChange={setViewportScale} />
+        <CadastreViewportFocus controlsRef={controlsRef} viewMode={viewMode} />
       </Canvas>
 
       {overlayText && (
@@ -3667,6 +4201,15 @@ export default function IfcViewport({
           </span>
         ) : null}
       </div>
+      {viewportScale ? (
+        <div className="pointer-events-none absolute bottom-3 right-3 z-20 rounded border border-slate-600/70 bg-slate-900/85 px-2 py-1 text-[11px] text-slate-100 shadow-md backdrop-blur-sm">
+          <div className="mb-1 text-right font-medium">{formatScaleDistance(viewportScale.meters)}</div>
+          <div
+            className="h-[3px] rounded-full bg-white/95"
+            style={{ width: `${viewportScale.pixels.toFixed(0)}px` }}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
