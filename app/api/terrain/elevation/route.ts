@@ -89,7 +89,7 @@ export async function POST(req: NextRequest) {
 
   const locations = body.locations?.filter((x) => typeof x === "string" && x.length > 0) ?? [];
   const dataset = (body.dataset || "srtm30m").trim();
-  const preferredProvider = body.provider === "opentopodata" ? "opentopodata" : "open-elevation";
+  const preferredProvider = body.provider === "open-elevation" ? "open-elevation" : "opentopodata";
   if (!locations.length) {
     return NextResponse.json({ error: "Нужен непустой массив locations." }, { status: 400 });
   }

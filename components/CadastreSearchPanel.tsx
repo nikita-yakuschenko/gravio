@@ -20,6 +20,8 @@ export function CadastreSearchPanel() {
   const terrainSource = useParcelBaseStore((s) => s.terrainSource);
   const terrainProviderPref = useParcelBaseStore((s) => s.terrainProviderPref);
   const setTerrainProviderPref = useParcelBaseStore((s) => s.setTerrainProviderPref);
+  const terrainEnabled = useParcelBaseStore((s) => s.terrainEnabled);
+  const setTerrainEnabled = useParcelBaseStore((s) => s.setTerrainEnabled);
 
   const applyFromPayload = useCallback(
     (json: NspdSearchResponse) => {
@@ -124,6 +126,18 @@ export function CadastreSearchPanel() {
           <div className="relative rounded-md border border-sky-500/30 bg-sky-500/5 p-2 text-[11px] text-slate-300">
             <p className="text-[10px] uppercase tracking-wide text-slate-500">Рельеф</p>
             <div className="absolute right-2 top-2 flex items-center rounded-md border border-slate-700 bg-slate-900/85 p-0.5">
+              <button
+                type="button"
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                  terrainEnabled
+                    ? "bg-cyan-600/20 text-cyan-100 ring-1 ring-cyan-500/40"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+                onClick={() => setTerrainEnabled(!terrainEnabled)}
+                title={terrainEnabled ? "Отключить рельеф (плоскость)" : "Включить рельеф"}
+              >
+                {terrainEnabled ? "RELIEF ON" : "RELIEF OFF"}
+              </button>
               <button
                 type="button"
                 className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${

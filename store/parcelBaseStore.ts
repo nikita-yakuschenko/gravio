@@ -34,10 +34,12 @@ interface ParcelBaseState {
   terrainMessage: string | null;
   terrainSource: TerrainSource;
   terrainProviderPref: TerrainProviderPref;
+  terrainEnabled: boolean;
   terrainField: TerrainField | null;
   applyFeature: (feature: GeoJsonFeature) => void;
   setTerrainStatus: (status: TerrainStatus, message?: string | null, source?: TerrainSource) => void;
   setTerrainProviderPref: (pref: TerrainProviderPref) => void;
+  setTerrainEnabled: (enabled: boolean) => void;
   setTerrainField: (field: TerrainField | null) => void;
   clear: () => void;
 }
@@ -74,7 +76,8 @@ export const useParcelBaseStore = create<ParcelBaseState>()(
       terrainStatus: "idle",
       terrainMessage: null,
       terrainSource: null,
-      terrainProviderPref: "open-elevation",
+      terrainProviderPref: "opentopodata",
+      terrainEnabled: false,
       terrainField: null,
 
       applyFeature: (feature) => {
@@ -106,6 +109,7 @@ export const useParcelBaseStore = create<ParcelBaseState>()(
       setTerrainStatus: (status, message = null, source = null) =>
         set({ terrainStatus: status, terrainMessage: message, terrainSource: source }),
       setTerrainProviderPref: (pref) => set({ terrainProviderPref: pref }),
+      setTerrainEnabled: (enabled) => set({ terrainEnabled: enabled }),
       setTerrainField: (field) => set({ terrainField: field }),
 
       clear: () =>

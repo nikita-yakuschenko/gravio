@@ -4,6 +4,10 @@ import { useMemo } from "react";
 import * as THREE from "three";
 import { Line } from "@react-three/drei";
 import { useParcelBaseStore } from "@/store/parcelBaseStore";
+import { VIEWPORT_OUTDOOR_SPEC } from "@/lib/viewportOutdoorSpec";
+
+const TERRAIN_WORLD_Y_OFFSET = VIEWPORT_OUTDOOR_SPEC.ground.planeY + 0.012;
+const BORDER_SURFACE_OFFSET = 0.12;
 
 function sampleTerrainHeight(
   field: { size: number; resolution: number; heights: number[] } | null,
@@ -43,18 +47,46 @@ export function CadastreParcelLayer() {
   const terrainField = useParcelBaseStore((s) => s.terrainField);
   const outlinePoints = useMemo(() => {
     if (!parcel?.ringClosedXZ?.length) return [] as THREE.Vector3[];
-    const open = parcel.ringClosedXZ.slice(0, -1);
-    const points = open.map(([x, z]) => {
-      const y = sampleTerrainHeight(terrainField, x, -z) + 0.075;
-      return new THREE.Vector3(x, y, -z);
-    });
+    const ring = parcel.ringClosedXZ.slice(0, -1);
+    const points: THREE.Vector3[] = [];
+    const segmentStepM = 1.25;
+    for (let i = 0; i < ring.length; i += 1) {
+      const a = ring[i]!;
+      const b = ring[(i + 1) % ring.length]!;
+      const ax = a[0];
+      const az = -a[1];
+      const bx = b[0];
+      const bz = -b[1];
+      const len = Math.hypot(bx - ax, bz - az);
+      const steps = Math.max(1, Math.ceil(len / segmentStepM));
+      const maxJ = i === ring.length - 1 ? steps : steps - 1;
+      for (let j = 0; j <= maxJ; j += 1) {
+        const t = steps === 0 ? 0 : j / steps;
+        const x = ax + (bx - ax) * t;
+        const worldZ = az + (bz - az) * t;
+        const y =
+          sampleTerrainHeight(terrainField, x, worldZ) +
+          TERRAIN_WORLD_Y_OFFSET +
+          BORDER_SURFACE_OFFSET;
+        points.push(new THREE.Vector3(x, y, worldZ));
+      }
+    }
     if (points.length > 0) points.push(points[0].clone());
     return points;
   }, [parcel?.ringClosedXZ, terrainField?.size, terrainField?.resolution, terrainField?.heights]);
 
-  if (!parcel) return null;
+  if (!parcel || outlinePoints.length < 2) return null;
 
   return (
-    <Line points={outlinePoints} color="#ffd400" lineWidth={4} dashed={false} renderOrder={12} />
+    <Line
+      points={outlinePoints}
+      color="#ffd400"
+      lineWidth={5}
+      dashed={false}
+      renderOrder={12}
+      depthTest
+      transparent={false}
+      opacity={1}
+    />
   );
 }

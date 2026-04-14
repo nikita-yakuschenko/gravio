@@ -174,6 +174,7 @@ function OutdoorGroundEnvironment() {
   const parcel = useParcelBaseStore((s) => s.parcel);
   const parcelRadius = parcel?.fitRadiusM ?? 0;
   const terrainProviderPref = useParcelBaseStore((s) => s.terrainProviderPref);
+  const terrainEnabled = useParcelBaseStore((s) => s.terrainEnabled);
   const { camera, size } = useThree();
   const [gridVisual, setGridVisual] = useState<{ size: number; divisions: number }>({
     size: VIEWPORT_OUTDOOR_SPEC.grid.size,
@@ -188,6 +189,18 @@ function OutdoorGroundEnvironment() {
   const gridRayRef = useRef(new THREE.Raycaster());
   const gridLeftRef = useRef(new THREE.Vector3());
   const gridRightRef = useRef(new THREE.Vector3());
+  const terrainCacheRef = useRef<
+    Map<
+      string,
+      {
+        field: { size: number; resolution: number; heights: number[] };
+        source: "open-elevation" | "opentopodata" | "unknown";
+        rawRange: number;
+        exaggeration: number;
+        baseLift: number;
+      }
+    >
+  >(new Map());
 
   useLayoutEffect(() => {
     const m = grassRef.current;
@@ -227,10 +240,19 @@ function OutdoorGroundEnvironment() {
       setTerrainStatus("idle", null, null);
       return;
     }
+    if (!terrainEnabled) {
+      setTerrainPatch((old) => {
+        old?.geometry.dispose();
+        return null;
+      });
+      setTerrainField(null);
+      setTerrainStatus("idle", "Режим плоскости: рельеф выключен.", null);
+      return;
+    }
     setTerrainStatus("loading", "Запрашиваем высоты...", null);
 
     const buildTerrain = async () => {
-      const n = 9; // 81 точка, укладываемся в лимит 100/запрос.
+      const n = 10; // 100 точек: умеренная детализация без «ломаных валов».
       const sizeM = Math.max(parcel.fitRadiusM * 2.4, 180);
       const half = sizeM / 2;
       const locations: string[] = [];
@@ -249,24 +271,105 @@ function OutdoorGroundEnvironment() {
         }
       }
 
-      try {
-        const res = await fetch("/api/terrain/elevation", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ dataset: "srtm30m", locations, provider: terrainProviderPref }),
-          cache: "no-store",
-        });
-        if (!res.ok) {
-          const err = (await res.json().catch(() => ({}))) as { error?: string; detail?: string };
-          throw new Error(err.detail ? `${err.error ?? "OpenTopoData error"}: ${err.detail}` : (err.error ?? `OpenTopoData ${res.status}`));
-        }
-        const json = (await res.json()) as {
-          provider?: string;
-          results?: Array<{ elevation: number | null }>;
-        };
-        const values = (json.results ?? []).map((r) =>
-          typeof r.elevation === "number" && Number.isFinite(r.elevation) ? r.elevation : NaN,
+      const cacheKey = `${parcel.loadedAt}:${terrainProviderPref}`;
+      const applyTerrainField = (
+        field: { size: number; resolution: number; heights: number[] },
+        info: {
+          source: "open-elevation" | "opentopodata" | "unknown";
+          rawRange: number;
+          exaggeration: number;
+          baseLift: number;
+        },
+        fromCache: boolean,
+      ) => {
+        const sampleCountLocal = field.resolution * field.resolution;
+        const geom = new THREE.PlaneGeometry(
+          field.size,
+          field.size,
+          field.resolution - 1,
+          field.resolution - 1,
         );
+        geom.rotateX(-Math.PI / 2);
+        const pos = geom.attributes.position;
+        const colorAttr = new Float32Array(sampleCountLocal * 3);
+        let minY = Infinity;
+        let maxY = -Infinity;
+        for (let idx = 0; idx < sampleCountLocal; idx++) {
+          const y = field.heights[idx] ?? 0;
+          pos.setY(idx, y);
+          minY = Math.min(minY, y);
+          maxY = Math.max(maxY, y);
+        }
+        pos.needsUpdate = true;
+        const spanY = Math.max(maxY - minY, 0.0001);
+        const low = new THREE.Color("#5f7d52");
+        const high = new THREE.Color("#bcd3a4");
+        const c = new THREE.Color();
+        for (let idx = 0; idx < sampleCountLocal; idx++) {
+          const y = pos.getY(idx);
+          const t = THREE.MathUtils.clamp((y - minY) / spanY, 0, 1);
+          c.copy(low).lerp(high, t);
+          colorAttr[idx * 3] = c.r;
+          colorAttr[idx * 3 + 1] = c.g;
+          colorAttr[idx * 3 + 2] = c.b;
+        }
+        geom.setAttribute("color", new THREE.Float32BufferAttribute(colorAttr, 3));
+        geom.computeVertexNormals();
+        setTerrainPatch((old) => {
+          old?.geometry.dispose();
+          return { geometry: geom, size: field.size };
+        });
+        setTerrainField(field);
+        setTerrainStatus(
+          "ready",
+          `${fromCache ? "Рельеф из кэша" : "Рельеф"}: ${sampleCountLocal} т., перепад ~${info.rawRange.toFixed(1)} м, x${info.exaggeration.toFixed(1)}, подъём +${info.baseLift.toFixed(2)} м`,
+          info.source,
+        );
+      };
+
+      const cached = terrainCacheRef.current.get(cacheKey);
+      if (cached) {
+        if (cancelled) return;
+        applyTerrainField(cached.field, cached, true);
+        return;
+      }
+
+      try {
+        // API ограничивает размер пакета; собираем поле батчами без потери порядка.
+        const chunkSize = 100;
+        const chunks: string[][] = [];
+        for (let i = 0; i < locations.length; i += chunkSize) {
+          chunks.push(locations.slice(i, i + chunkSize));
+        }
+
+        const values: number[] = [];
+        let resolvedProvider: "open-elevation" | "opentopodata" | "unknown" = "unknown";
+        for (const chunk of chunks) {
+          const res = await fetch("/api/terrain/elevation", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dataset: "srtm30m", locations: chunk, provider: terrainProviderPref }),
+            cache: "no-store",
+          });
+          if (!res.ok) {
+            const err = (await res.json().catch(() => ({}))) as { error?: string; detail?: string };
+            throw new Error(
+              err.detail
+                ? `${err.error ?? "OpenTopoData error"}: ${err.detail}`
+                : (err.error ?? `OpenTopoData ${res.status}`),
+            );
+          }
+          const json = (await res.json()) as {
+            provider?: string;
+            results?: Array<{ elevation: number | null }>;
+          };
+          resolvedProvider = (json.provider as "open-elevation" | "opentopodata" | undefined) ?? resolvedProvider;
+          const chunkValues = (json.results ?? []).map((r) =>
+            typeof r.elevation === "number" && Number.isFinite(r.elevation) ? r.elevation : NaN,
+          );
+          values.push(...chunkValues);
+        }
+
         if (values.length !== sampleCount) throw new Error("Invalid elevation samples");
         const finite = values.filter((v) => Number.isFinite(v));
         if (finite.length < 8) throw new Error("Too few finite elevations");
@@ -318,19 +421,27 @@ function OutdoorGroundEnvironment() {
         geom.setAttribute("color", new THREE.Float32BufferAttribute(colorAttr, 3));
         geom.computeVertexNormals();
 
+        const field = {
+          size: sizeM,
+          resolution: n,
+          heights: Array.from({ length: sampleCount }, (_, idx) => pos.getY(idx)),
+        };
+        terrainCacheRef.current.set(cacheKey, {
+          field,
+          source: resolvedProvider,
+          rawRange,
+          exaggeration,
+          baseLift,
+        });
         setTerrainPatch((old) => {
           old?.geometry.dispose();
           return { geometry: geom, size: sizeM };
         });
-        setTerrainField({
-          size: sizeM,
-          resolution: n,
-          heights: Array.from({ length: sampleCount }, (_, idx) => pos.getY(idx)),
-        });
+        setTerrainField(field);
         setTerrainStatus(
           "ready",
           `Рельеф: ${sampleCount} т., перепад ~${rawRange.toFixed(1)} м, x${exaggeration.toFixed(1)}, подъём +${baseLift.toFixed(2)} м`,
-          (json.provider as "open-elevation" | "opentopodata" | undefined) ?? "unknown",
+          resolvedProvider,
         );
       } catch (e) {
         if (cancelled) return;
@@ -348,7 +459,7 @@ function OutdoorGroundEnvironment() {
     return () => {
       cancelled = true;
     };
-  }, [parcel?.loadedAt, parcel?.fitRadiusM, parcel?.center3857?.x, parcel?.center3857?.y, terrainProviderPref]);
+  }, [parcel?.loadedAt, parcel?.fitRadiusM, parcel?.center3857?.x, parcel?.center3857?.y, terrainProviderPref, terrainEnabled]);
 
   useFrame(() => {
     frameTickRef.current += 1;
@@ -435,11 +546,8 @@ function OutdoorGroundEnvironment() {
             vertexColors
             roughness={0.92}
             metalness={0.02}
-            transparent
-            opacity={0.96}
-            polygonOffset
-            polygonOffsetFactor={1}
-            polygonOffsetUnits={1}
+            transparent={false}
+            opacity={1}
           />
         </mesh>
       ) : null}
@@ -2839,6 +2947,7 @@ export default function IfcViewport({
   useEffect(() => {
     if (!terrainFieldForPlacement || isTransforming) return;
     for (const model of models) {
+      if (model.id === activeModelId) continue;
       if (!model.isPlaced || model.analysisStatus !== "ready") continue;
       const entry = cache.get(geometryCacheKey(model));
       if (!entry) continue;
@@ -2848,7 +2957,7 @@ export default function IfcViewport({
       if (model.placement.y >= nextY - 0.005) continue;
       onPlacementCommit(model.id, { ...model.placement, y: nextY });
     }
-  }, [cache, isTransforming, models, onPlacementCommit, resolvePlacementY, terrainFieldForPlacement]);
+  }, [activeModelId, cache, isTransforming, models, onPlacementCommit, resolvePlacementY, terrainFieldForPlacement]);
 
   useEffect(() => {
     const readyModels = models.filter((item) => item.isPlaced && item.analysisStatus === "ready");
@@ -2994,15 +3103,23 @@ export default function IfcViewport({
       z: draftPlacementRef.current.z,
       rotationY: normalizeAngle(draftPlacementRef.current.rotationY),
     };
-    const stabilized = keepPlacementAboveTerrain(
-      nextPlacement,
-      activeObject,
-      activeGeometryEntry?.bounds ?? null,
-    );
+    const movedHorizontally =
+      Math.hypot(
+        nextPlacement.x - activePlacement.x,
+        nextPlacement.z - activePlacement.z,
+      ) > 0.01;
+    // Чистая ручная коррекция по высоте (Y) не должна блокироваться автопосадкой.
+    const stabilized = movedHorizontally
+      ? keepPlacementAboveTerrain(
+          nextPlacement,
+          activeObject,
+          activeGeometryEntry?.bounds ?? null,
+        )
+      : nextPlacement;
     setDraftPlacement(stabilized);
     draftPlacementRef.current = stabilized;
     onPlacementCommit(activeModelId, stabilized);
-  }, [activeGeometryEntry?.bounds, activeModelId, activeObject, keepPlacementAboveTerrain, onPlacementCommit]);
+  }, [activeGeometryEntry?.bounds, activeModelId, activeObject, activePlacement.x, activePlacement.z, keepPlacementAboveTerrain, onPlacementCommit]);
 
   const setCameraControlsEnabled = useCallback((enabled: boolean) => {
     if (controlsRef.current) controlsRef.current.enabled = enabled;
